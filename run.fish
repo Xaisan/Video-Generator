@@ -14,7 +14,7 @@
 #   • Input image in ./input/
 
 set -l SCRIPT_DIR (dirname (status -f))
-set -l IMAGE_NAME "wan22-i2v-amd"
+set -l IMAGE_NAME "wan22-i2v"
 set -l IMAGE_TAG "latest"
 
 # Parse flags
@@ -48,8 +48,8 @@ if test $DO_BUILD -eq 1; or not docker image inspect $IMAGE_NAME:$IMAGE_TAG >/de
     end
 end
 
-# Create output / sessions dirs
-mkdir -p $SCRIPT_DIR/output $SCRIPT_DIR/input $SCRIPT_DIR/sessions
+# Create output / sessions / hf_cache dirs
+mkdir -p $SCRIPT_DIR/output $SCRIPT_DIR/input $SCRIPT_DIR/sessions $SCRIPT_DIR/hf_cache
 
 # Determine entrypoint
 set -l ENTRYPOINT_ARGS
@@ -69,17 +69,16 @@ docker run --rm $RUN_FLAGS \
     --device /dev/kfd \
     --device /dev/dri \
     --group-add video \
+    --group-add render \
+    --ipc=host \
     --security-opt seccomp=unconfined \
-    -e HSA_OVERRIDE_GFX_VERSION=11.0.0 \
-    -e HIP_VISIBLE_DEVICES=0 \
-    -e PYTORCH_HIP_ALLOC_CONF=expandable_segments:True \
+    -e HF_HOME=/app/hf_cache \
     -p $PORT:7860 \
     -v $SCRIPT_DIR/models:/app/models:ro \
     -v $SCRIPT_DIR/input:/app/input \
     -v $SCRIPT_DIR/output:/app/output \
     -v $SCRIPT_DIR/sessions:/app/sessions \
-    -v $SCRIPT_DIR/config.yaml:/app/config.yaml:ro \
-    -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+    -v $SCRIPT_DIR/hf_cache:/app/hf_cache \
     --shm-size 16g \
     $ENTRYPOINT_ARGS \
     $IMAGE_NAME:$IMAGE_TAG \

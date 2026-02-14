@@ -4,9 +4,12 @@ Web UI for Wan 2.2 I2V Video Generator.
 Flask + Server-Sent Events for real-time progress.
 """
 
+import collections
 import json
+import logging
 import os
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -42,6 +45,64 @@ sse_clients: dict[str, queue.Queue] = {}
 active_thread: threading.Thread | None = None
 active_session_id: str | None = None
 generation_lock = threading.Lock()
+
+# ─── Log capture ring buffer ──────────────────────────────────────
+LOG_BUFFER_SIZE = 500
+log_buffer: collections.deque = collections.deque(maxlen=LOG_BUFFER_SIZE)
+log_lock = threading.Lock()
+
+
+class LogCapture(logging.Handler):
+    """Capture log lines into a ring buffer for the web UI."""
+    def emit(self, record):
+        try:
+            line = self.format(record)
+            with log_lock:
+                log_buffer.append({
+                    "ts": time.time(),
+                    "level": record.levelname,
+                    "msg": line,
+                })
+        except Exception:
+            pass
+
+
+# Also capture stdout/stderr prints from pipeline_engine
+class StdoutCapture:
+    def __init__(self, original):
+        self.original = original
+
+    def write(self, text):
+        self.original.write(text)
+        if text.strip():
+            with log_lock:
+                log_buffer.append({
+                    "ts": time.time(),
+                    "level": "INFO",
+                    "msg": text.rstrip(),
+                })
+
+    def flush(self):
+        self.original.flush()
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        return self.original.fileno()
+
+    def writable(self):
+        return True
+
+
+# Install log capture
+_log_handler = LogCapture()
+_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s",
+                                            datefmt="%H:%M:%S"))
+logging.root.addHandler(_log_handler)
+logging.root.setLevel(logging.INFO)
+sys.stdout = StdoutCapture(sys.__stdout__)
+sys.stderr = StdoutCapture(sys.__stderr__)
 
 
 def get_engine() -> PipelineEngine:
@@ -158,11 +219,13 @@ def api_generate():
             "height": int(data.get("height", config.get("height", 480))),
             "num_frames": int(data.get("num_frames", config.get("num_frames", 81))),
             "num_inference_steps": int(data.get("num_inference_steps", config.get("num_inference_steps", 8))),
-            "guidance_scale": float(data.get("guidance_scale", config.get("guidance_scale", 1.0))),
-            "guidance_scale_2": float(data.get("guidance_scale_2", config.get("guidance_scale_2", 1.0))),
+            "guidance_scale": float(data.get("guidance_scale", config.get("guidance_scale", 2.0))),
+            "guidance_scale_2": float(data.get("guidance_scale_2", config.get("guidance_scale_2", 2.0))),
             "flow_shift": float(data.get("flow_shift", config.get("flow_shift", 8.0))),
             "seed": int(data.get("seed", config.get("seed", 42))),
             "fps": int(data.get("fps", config.get("fps", 16))),
+            "duration": float(data.get("duration", config.get("duration", 5.0))),
+            "output_fps": int(data.get("output_fps", config.get("output_fps", 24))),
             "enable_upscale": data.get("enable_upscale", False),
             "lora_scales": data.get("lora_scales", []),
         }
@@ -248,6 +311,10 @@ def api_resume(session_id):
             info.lora_scales = data["lora_scales"]
         if "enable_upscale" in data:
             info.enable_upscale = bool(data["enable_upscale"])
+        if "output_fps" in data:
+            info.output_fps = int(data["output_fps"])
+        if "duration" in data:
+            info.duration = float(data["duration"])
 
         # Reset steps from start_step onwards
         start_idx = STEP_ORDER.index(start_step) if start_step in STEP_ORDER else 0
@@ -304,6 +371,57 @@ def api_vram():
 @app.route("/api/config", methods=["GET"])
 def api_config():
     return jsonify(get_cfg())
+
+
+@app.route("/api/active", methods=["GET"])
+def api_active():
+    """Return the currently running session ID (if any)."""
+    return jsonify({
+        "session_id": active_session_id,
+        "running": active_session_id is not None,
+    })
+
+
+@app.route("/api/logs", methods=["GET"])
+def api_logs():
+    """Return recent log lines (last N entries)."""
+    n = int(request.args.get("n", 100))
+    since = float(request.args.get("since", 0))
+    with log_lock:
+        lines = [l for l in log_buffer if l["ts"] > since]
+    return jsonify(lines[-n:])
+
+
+@app.route("/api/sessions/<session_id>/clone", methods=["POST"])
+def api_clone_session(session_id):
+    """Return the generation parameters from a session so the user can
+    pre-fill the generate form with them (clone-to-generate)."""
+    info = sm.get_session(session_id)
+    if not info:
+        return jsonify({"error": "Session not found"}), 404
+    d = info.to_dict()
+    # Return only the params relevant for generating
+    clone = {
+        "prompt": d.get("prompt", ""),
+        "negative_prompt": d.get("negative_prompt", ""),
+        "width": d.get("width", 832),
+        "height": d.get("height", 480),
+        "num_frames": d.get("num_frames", 81),
+        "num_inference_steps": d.get("num_inference_steps", 8),
+        "guidance_scale": d.get("guidance_scale", 2.0),
+        "guidance_scale_2": d.get("guidance_scale_2", 2.0),
+        "flow_shift": d.get("flow_shift", 8.0),
+        "seed": d.get("seed", 42),
+        "fps": d.get("fps", 16),
+        "duration": d.get("duration", 5.0),
+        "output_fps": d.get("output_fps", 24),
+        "enable_upscale": d.get("enable_upscale", False),
+        "lora_scales": d.get("lora_scales", []),
+        # input image served from session dir
+        "input_image_url": f"/sessions/{session_id}/input.png"
+                          if (sm.session_dir(session_id) / "input.png").exists() else "",
+    }
+    return jsonify(clone)
 
 
 # ─── SSE endpoint ──────────────────────────────────────────────────

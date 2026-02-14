@@ -1,8 +1,10 @@
 # ─── AMD ROCm PyTorch base ──────────────────────────────────────────
-FROM rocm/pytorch:rocm6.3.4_ubuntu22.04_py3.10_pytorch_release_2.6.0
+FROM rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
 # Use gfx1100 for RX 7900 XTX (RDNA3)
 ENV HSA_OVERRIDE_GFX_VERSION=11.0.0
 ENV HIP_VISIBLE_DEVICES=0
+# PyTorch 2.9+ uses PYTORCH_ALLOC_CONF (PYTORCH_HIP_ALLOC_CONF is deprecated)
+ENV PYTORCH_ALLOC_CONF=expandable_segments:True
 ENV PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
 ENV TOKENIZERS_PARALLELISM=false
 
@@ -17,7 +19,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ─── Copy project code ─────────────────────────────────────────────
-COPY generate.py config.yaml amd_tune.py upscale.py ./
+COPY generate.py config.yaml amd_tune.py upscale.py rife_model.py ./
 COPY session_manager.py pipeline_engine.py app.py ./
 COPY templates/ templates/
 COPY static/ static/

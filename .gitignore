@@ -1,2 +1,8 @@
 # ignore models
 models/
+input/
+output/
+sessions/
+hf_cache/
+.venv/
+__pycache__/

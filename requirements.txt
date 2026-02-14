@@ -17,6 +17,7 @@ protobuf
 Pillow>=10.0
 imageio>=2.34
 imageio-ffmpeg>=0.5
+av>=12.0
 numpy>=1.26
 
 # ─── Prompt helpers ────────────────────────────────────────────────
@@ -26,5 +27,11 @@ ftfy
 pyyaml
 tqdm
 
+# ─── Upscale (Spandrel — modern model loader, used by ComfyUI) ────
+spandrel>=0.4.0
+
 # ─── Web UI ─────────────────────────────────────────────────────────
 flask>=3.0
+
+# ─── System monitoring ─────────────────────────────────────────────
+psutil>=5.9

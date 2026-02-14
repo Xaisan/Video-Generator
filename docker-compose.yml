@@ -1,0 +1,46 @@
+services:
+  wan22-i2v:
+    build: .
+    image: wan22-i2v:latest
+    container_name: wan22-i2v
+    restart: unless-stopped
+
+    # AMD GPU passthrough
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    ipc: host
+    security_opt:
+      - seccomp=unconfined
+    shm_size: 16g
+
+    environment:
+      - HF_HOME=/app/hf_cache
+      - PYTHONUNBUFFERED=1
+
+    ports:
+      - "7860:7860"
+
+    volumes:
+      - ./models:/app/models:ro
+      - ./input:/app/input
+      - ./output:/app/output
+      - ./sessions:/app/sessions
+      - hf_cache:/app/hf_cache
+      # Bind-mount source code so changes apply without rebuilding
+      - ./app.py:/app/app.py:ro
+      - ./pipeline_engine.py:/app/pipeline_engine.py:ro
+      - ./session_manager.py:/app/session_manager.py:ro
+      - ./upscale.py:/app/upscale.py:ro
+      - ./rife_model.py:/app/rife_model.py:ro
+      - ./generate.py:/app/generate.py:ro
+      - ./config.yaml:/app/config.yaml:ro
+      - ./amd_tune.py:/app/amd_tune.py:ro
+      - ./templates:/app/templates:ro
+      - ./static:/app/static:ro
+
+volumes:
+  hf_cache:

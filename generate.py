@@ -360,7 +360,7 @@ def generate(pipe, cfg: dict) -> str:
 
     # ── Run pipeline ────────────────────────────────────────────────
     steps = cfg.get("num_inference_steps", 8)
-    cfg_scale = cfg.get("guidance_scale", 1.0)
+    cfg_scale = cfg.get("guidance_scale", 2.0)
     cfg_scale_2 = cfg.get("guidance_scale_2", cfg_scale)
     neg_prompt = cfg.get("negative_prompt", "")
     prompt = cfg.get("prompt", "")

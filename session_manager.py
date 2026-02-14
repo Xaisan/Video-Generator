@@ -9,8 +9,8 @@ Each session gets a directory under sessions/<session_id>/ containing:
   latents.pt      — denoised latent tensor (after denoise step)
   frames.pt       — decoded video frames tensor (after VAE decode step)
   preview.mp4     — low-quality preview from frames
-  video.mp4       — final exported video
-  video_upscaled.mp4 — optional upscaled video
+  output.mp4      — final exported video
+  output_upscaled.mp4 — optional upscaled video
 """
 
 import json
@@ -56,11 +56,13 @@ class SessionInfo:
     height: int = 480
     num_frames: int = 81
     num_inference_steps: int = 8
-    guidance_scale: float = 1.0
-    guidance_scale_2: float = 1.0
+    guidance_scale: float = 2.0
+    guidance_scale_2: float = 2.0
     flow_shift: float = 8.0
     seed: int = 42
     fps: int = 16
+    duration: float = 5.0          # Video length in seconds
+    output_fps: int = 24           # Output framerate after RIFE interpolation
     enable_upscale: bool = False
 
     # LoRA overrides (list of {adapter_name, scale})
@@ -123,11 +125,13 @@ class SessionManager:
             height=int(params.get("height", 480)),
             num_frames=int(params.get("num_frames", 81)),
             num_inference_steps=int(params.get("num_inference_steps", 8)),
-            guidance_scale=float(params.get("guidance_scale", 1.0)),
-            guidance_scale_2=float(params.get("guidance_scale_2", 1.0)),
+            guidance_scale=float(params.get("guidance_scale", 2.0)),
+            guidance_scale_2=float(params.get("guidance_scale_2", 2.0)),
             flow_shift=float(params.get("flow_shift", 8.0)),
             seed=int(params.get("seed", 42)),
             fps=int(params.get("fps", 16)),
+            duration=float(params.get("duration", 5.0)),
+            output_fps=int(params.get("output_fps", 24)),
             enable_upscale=bool(params.get("enable_upscale", False)),
             lora_scales=params.get("lora_scales", []),
         )

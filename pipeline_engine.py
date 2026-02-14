@@ -12,6 +12,14 @@ The pipeline is decomposed into discrete steps that can be run independently:
 Between each step, the previous stage's heavy models are freed from VRAM.
 Intermediate results are checkpointed to the session directory so any
 step can be resumed without re-running earlier ones.
+
+Memory strategy (denoise step):
+  - Transformers are loaded ONE AT A TIME (~10 GB RAM each, not ~20 GB).
+  - LoRAs are loaded per-pass (no duplicate adapter warnings).
+  - Embeddings are moved to GPU once, not implicitly per step.
+  - block_level offloading is used by default (fewer PCIe transfers,
+    higher GPU utilisation than leaf_level).
+  - VAE is freed before any transformer loads.
 """
 
 import gc
@@ -19,6 +27,7 @@ import os
 import sys
 import time
 import traceback
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -29,13 +38,28 @@ from PIL import Image
 from session_manager import SessionManager, StepStatus, STEP_ORDER
 
 
-# ─── VRAM cleanup ──────────────────────────────────────────────────
+# ─── VRAM / RAM helpers ────────────────────────────────────────────
 def flush_vram():
     """Aggressively free GPU memory."""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+
+def ram_stats() -> dict:
+    """Return current system RAM usage."""
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        return {
+            "total_gb": round(mem.total / 1024**3, 2),
+            "used_gb": round(mem.used / 1024**3, 2),
+            "available_gb": round(mem.available / 1024**3, 2),
+            "percent": mem.percent,
+        }
+    except ImportError:
+        return {"available": False}
 
 
 def vram_stats() -> dict:
@@ -47,7 +71,7 @@ def vram_stats() -> dict:
         "name": torch.cuda.get_device_name(0),
         "allocated_gb": round(torch.cuda.memory_allocated() / 1024**3, 2),
         "reserved_gb": round(torch.cuda.memory_reserved() / 1024**3, 2),
-        "total_gb": round(torch.cuda.get_device_properties(0).total_mem / 1024**3, 2),
+        "total_gb": round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2),
     }
 
 
@@ -57,9 +81,9 @@ def apply_amd_env(cfg: dict) -> None:
     os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION",
                           amd.get("hsa_override_gfx_version", "11.0.0"))
     os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
-    os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF",
-                          amd.get("pytorch_hip_alloc_conf",
-                                  "expandable_segments:True"))
+    alloc_conf = amd.get("pytorch_hip_alloc_conf", "expandable_segments:True")
+    os.environ["PYTORCH_ALLOC_CONF"] = alloc_conf
+    os.environ["PYTORCH_HIP_ALLOC_CONF"] = alloc_conf
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
@@ -81,10 +105,10 @@ def snap_to_mod(value: int, mod: int = 16) -> int:
     return (value // mod) * mod
 
 
-# ─── Pipeline component loaders (load on demand, free after use) ───
+# ─── Component loaders (load on demand, free after use) ────────────
 
 def load_text_encoder(cfg: dict):
-    """Load just the text encoder + tokenizer."""
+    """Load text encoder + tokenizer from HuggingFace."""
     from transformers import AutoTokenizer, UMT5EncoderModel
 
     model_id = cfg["model_id"]
@@ -92,43 +116,44 @@ def load_text_encoder(cfg: dict):
     force_fp16 = amd.get("force_fp16", False)
     dtype = torch.float16 if force_fp16 else torch.bfloat16
 
+    print(f"  Loading tokenizer from {model_id}")
     tokenizer = AutoTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+
+    print(f"  Loading text encoder from {model_id}")
     text_encoder = UMT5EncoderModel.from_pretrained(
         model_id, subfolder="text_encoder", torch_dtype=dtype,
     )
     return tokenizer, text_encoder
 
 
-def load_image_encoder(cfg: dict):
-    """Load CLIP image encoder + processor."""
-    from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
-
-    model_id = cfg["model_id"]
-    amd = cfg.get("amd", {})
-    force_fp16 = amd.get("force_fp16", False)
-    dtype = torch.float16 if force_fp16 else torch.bfloat16
-
-    image_processor = CLIPImageProcessor.from_pretrained(
-        model_id, subfolder="image_processor"
-    )
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-        model_id, subfolder="image_encoder", torch_dtype=dtype,
-    )
-    return image_processor, image_encoder
-
-
 def load_vae(cfg: dict):
-    """Load VAE in float32."""
+    """Load VAE in float32. Uses local safetensors if available."""
     from diffusers import AutoencoderKLWan
     model_id = cfg["model_id"]
-    vae = AutoencoderKLWan.from_pretrained(
-        model_id, subfolder="vae", torch_dtype=torch.float32,
-    )
+
+    local_vae = Path("models/vae/wan_2.1_vae.safetensors")
+    if local_vae.exists():
+        print(f"  Loading local VAE: {local_vae}")
+        vae = AutoencoderKLWan.from_single_file(
+            str(local_vae),
+            config=model_id,
+            subfolder="vae",
+            torch_dtype=torch.float32,
+        )
+    else:
+        print(f"  Downloading VAE from {model_id}")
+        vae = AutoencoderKLWan.from_pretrained(
+            model_id, subfolder="vae", torch_dtype=torch.float32,
+        )
     return vae
 
 
-def load_transformers(cfg: dict):
-    """Load both GGUF transformers."""
+def load_single_transformer(cfg: dict, which: str = "high"):
+    """Load ONE GGUF transformer to halve peak RAM (~10 GB instead of ~20 GB).
+
+    Args:
+        which: "high" for high-noise transformer, "low" for low-noise.
+    """
     from diffusers import WanTransformer3DModel, GGUFQuantizationConfig
 
     model_id = cfg["model_id"]
@@ -137,24 +162,29 @@ def load_transformers(cfg: dict):
     dtype = torch.float16 if force_fp16 else torch.bfloat16
     quant_config = GGUFQuantizationConfig(compute_dtype=dtype)
 
-    gguf_high = cfg["gguf_transformer_high"]
-    gguf_low = cfg["gguf_transformer_low"]
+    if which == "high":
+        gguf_path = cfg["gguf_transformer_high"]
+        subfolder = "transformer"
+    else:
+        gguf_path = cfg["gguf_transformer_low"]
+        subfolder = "transformer_2"
 
-    transformer_high = WanTransformer3DModel.from_single_file(
-        gguf_high,
+    print(f"  Loading GGUF transformer ({which}): {gguf_path}")
+    transformer = WanTransformer3DModel.from_single_file(
+        gguf_path,
         quantization_config=quant_config,
         config=model_id,
-        subfolder="transformer",
+        subfolder=subfolder,
         torch_dtype=dtype,
     )
-    transformer_low = WanTransformer3DModel.from_single_file(
-        gguf_low,
-        quantization_config=quant_config,
-        config=model_id,
-        subfolder="transformer_2",
-        torch_dtype=dtype,
-    )
-    return transformer_high, transformer_low
+    return transformer
+
+
+def load_transformers(cfg: dict):
+    """Load both GGUF transformers (legacy — kept for backward compat)."""
+    high = load_single_transformer(cfg, "high")
+    low = load_single_transformer(cfg, "low")
+    return high, low
 
 
 def load_scheduler(cfg: dict):
@@ -163,14 +193,10 @@ def load_scheduler(cfg: dict):
     from diffusers import WanImageToVideoPipeline
 
     model_id = cfg["model_id"]
-    # Load scheduler config from HF hub
     pipe_tmp = WanImageToVideoPipeline.from_pretrained(
         model_id,
-        transformer=None,
-        transformer_2=None,
-        text_encoder=None,
-        vae=None,
-        image_encoder=None,
+        transformer=None, transformer_2=None,
+        text_encoder=None, vae=None, image_encoder=None,
         torch_dtype=torch.float32,
     )
     sched_config = pipe_tmp.scheduler.config
@@ -182,73 +208,109 @@ def load_scheduler(cfg: dict):
     return scheduler
 
 
-# ─── LoRA loading ──────────────────────────────────────────────────
-def apply_loras(pipe, cfg: dict, lora_overrides: list | None = None):
-    """Load LoRAs into the pipeline (unfused for GGUF)."""
-    lora_cfgs = cfg.get("loras", [])
+# ─── LoRA loading (per-transformer) ───────────────────────────────
+def apply_loras_to_transformer(pipe, cfg: dict, target: str,
+                               lora_overrides: list | None = None):
+    """Load LoRAs for a SINGLE transformer target.
+
+    target: "transformer" or "transformer_2"
+
+    This avoids loading all LoRAs at once (halves RAM pressure) and
+    prevents the duplicate peft_config warning.
+    """
+    import copy
+    lora_cfgs = copy.deepcopy(cfg.get("loras", []))
     if not lora_cfgs:
         return
 
     # Apply scale overrides from session
     if lora_overrides:
-        override_map = {o["adapter_name"]: o["scale"] for o in lora_overrides}
-        for lora in lora_cfgs:
-            if lora["adapter_name"] in override_map:
-                lora["scale"] = override_map[lora["adapter_name"]]
+        if lora_overrides and isinstance(lora_overrides[0], (int, float)):
+            for i, scale_val in enumerate(lora_overrides):
+                if i < len(lora_cfgs):
+                    lora_cfgs[i]["scale"] = float(scale_val)
+        else:
+            override_map = {o["adapter_name"]: o["scale"] for o in lora_overrides}
+            for lora in lora_cfgs:
+                if lora["adapter_name"] in override_map:
+                    lora["scale"] = override_map[lora["adapter_name"]]
 
-    high_adapters, low_adapters = [], []
-    high_scales, low_scales = {}, {}
+    # Filter to only LoRAs for this target
+    target_loras = [l for l in lora_cfgs if l.get("target", "transformer") == target]
+    if not target_loras:
+        return
 
-    for lora in lora_cfgs:
+    adapters = []
+    scales = {}
+
+    for lora in target_loras:
         path = lora["path"]
-        target = lora.get("target", "transformer")
         name = lora["adapter_name"]
         scale = lora.get("scale", 1.0)
 
         if not os.path.isfile(path):
+            print(f"  ⚠ LoRA not found, skipping: {path}")
             continue
 
-        if target == "transformer":
-            try:
+        print(f"  📦 Loading LoRA: {name} → {target} (scale={scale})")
+        try:
+            if target == "transformer_2":
+                pipe.load_lora_weights(path, adapter_name=name,
+                                       load_into_transformer_2=True)
+            else:
                 pipe.load_lora_weights(path, adapter_name=name)
-                high_adapters.append(name)
-                high_scales[name] = scale
-            except Exception as e:
-                print(f"  ❌ LoRA {name}: {e}")
+            adapters.append(name)
+            scales[name] = scale
+        except Exception as e:
+            print(f"  ❌ LoRA {name}: {e}")
 
-        elif target == "transformer_2":
-            if not hasattr(pipe, "transformer_2") or pipe.transformer_2 is None:
-                continue
-            try:
-                pipe.load_lora_weights(path, adapter_name=name, load_into_transformer_2=True)
-                low_adapters.append(name)
-                low_scales[name] = scale
-            except Exception as e:
-                print(f"  ❌ LoRA {name}: {e}")
-
-    if high_adapters:
-        pipe.transformer.set_adapters(high_adapters,
-                                      weights=[high_scales[a] for a in high_adapters])
-    if low_adapters and hasattr(pipe, "transformer_2") and pipe.transformer_2:
-        pipe.transformer_2.set_adapters(low_adapters,
-                                        weights=[low_scales[a] for a in low_adapters])
+    if adapters:
+        model = pipe.transformer if target == "transformer" else pipe.transformer_2
+        if model is not None:
+            model.set_adapters(adapters, weights=[scales[a] for a in adapters])
+            print(f"  ✅ Active adapters on {target}: {adapters}")
 
 
-# ─── Group offloading ──────────────────────────────────────────────
+def apply_loras(pipe, cfg: dict, lora_overrides: list | None = None):
+    """Load LoRAs into the pipeline (legacy wrapper — both targets)."""
+    apply_loras_to_transformer(pipe, cfg, "transformer", lora_overrides)
+    if hasattr(pipe, "transformer_2") and pipe.transformer_2 is not None:
+        apply_loras_to_transformer(pipe, cfg, "transformer_2", lora_overrides)
+
+
+# ─── Group offloading helpers ──────────────────────────────────────
 def setup_offloading(module, cfg: dict):
-    """Apply group offloading to a single module."""
+    """Apply group offloading to a single module.
+
+    Defaults to block_level for better GPU utilisation on AMD.
+    use_stream is hardcoded False for AMD/HIP compatibility.
+    """
     from diffusers.hooks import apply_group_offloading
-    apply_group_offloading(
-        module,
-        offload_type=cfg.get("offload_type", "leaf_level"),
+    offload_type = cfg.get("offload_type", "block_level")
+    num_blocks = cfg.get("num_blocks_per_group", 1)
+    print(f"  Setting up {offload_type} offloading (num_blocks_per_group={num_blocks})…")
+    kwargs = dict(
+        offload_type=offload_type,
         offload_device=torch.device("cpu"),
         onload_device=torch.device("cuda"),
-        use_stream=cfg.get("use_stream", True),
+        use_stream=False,
     )
+    if offload_type == "block_level":
+        kwargs["num_blocks_per_group"] = num_blocks
+    apply_group_offloading(module, **kwargs)
+
+
+def remove_offloading(module):
+    """Remove group offloading hooks from a module (safe to call if none)."""
+    if hasattr(module, "_diffusers_hook"):
+        try:
+            module._diffusers_hook.remove_hook("group_offloading", recurse=True)
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Pipeline Engine — orchestrates step-by-step generation
+#  Pipeline Engine
 # ═══════════════════════════════════════════════════════════════════
 
 class PipelineEngine:
@@ -256,8 +318,7 @@ class PipelineEngine:
     Runs the video generation pipeline step-by-step with checkpointing.
 
     The pipeline object is NOT kept alive between steps — each step loads
-    only the components it needs, then frees them.  This keeps VRAM usage
-    minimal between steps.
+    only the components it needs, then frees them.
     """
 
     def __init__(self, config_path: str = "config.yaml"):
@@ -281,7 +342,7 @@ class PipelineEngine:
 
     # ─── Step 1: Encode ─────────────────────────────────────────────
     def step_encode(self, session_id: str) -> bool:
-        """Encode text prompt + input image → embeddings checkpoint."""
+        """Encode text prompt → embeddings checkpoint."""
         info = self.sm.get_session(session_id)
         if not info:
             return False
@@ -296,12 +357,11 @@ class PipelineEngine:
             force_fp16 = amd.get("force_fp16", False)
             dtype = torch.float16 if force_fp16 else torch.bfloat16
 
-            # ── Text encoding ───────────────────────────────────────
-            self._emit(session_id, "encode", 10, "Encoding text prompt…")
+            self._emit(session_id, "encode", 10, "Loading tokenizer + text encoder…")
             tokenizer, text_encoder = load_text_encoder(cfg)
             text_encoder.to("cuda")
 
-            # Tokenize
+            self._emit(session_id, "encode", 30, "Encoding prompt…")
             prompt_ids = tokenizer(
                 info.prompt, max_length=512, padding="max_length",
                 truncation=True, return_tensors="pt",
@@ -319,39 +379,21 @@ class PipelineEngine:
                     neg_ids.input_ids.to("cuda")
                 ).last_hidden_state
 
-            # Free text encoder
             del text_encoder, tokenizer
             flush_vram()
-            self._emit(session_id, "encode", 50, "Text encoded. Loading image encoder…")
+            print(f"  === ENCODE CLEANUP === VRAM: {vram_stats()}", flush=True)
+            self._emit(session_id, "encode", 90, "Text encoded, saving checkpoint…")
 
-            # ── Image encoding ──────────────────────────────────────
-            image = prepare_image(info.input_image, info.width, info.height)
-            image_processor, image_encoder = load_image_encoder(cfg)
-            image_encoder.to("cuda")
-
-            pixel_values = image_processor(
-                images=image, return_tensors="pt"
-            ).pixel_values.to("cuda", dtype=dtype)
-
-            with torch.no_grad():
-                image_embeds = image_encoder(pixel_values).image_embeds
-
-            # Free image encoder
-            del image_encoder, image_processor
-            flush_vram()
-
-            # ── Save checkpoint ─────────────────────────────────────
             checkpoint = {
                 "prompt_embeds": prompt_embeds.cpu(),
                 "negative_prompt_embeds": neg_embeds.cpu(),
-                "image_embeds": image_embeds.cpu(),
             }
             self.sm.save_checkpoint(session_id, "embeddings", checkpoint)
 
             elapsed = time.time() - t0
             self.sm.update_step(session_id, "encode", StepStatus.DONE, elapsed)
             self._emit(session_id, "encode", 100,
-                       f"Encoding done in {elapsed:.1f}s")
+                       f"Text encoding done in {elapsed:.1f}s")
             flush_vram()
             return True
 
@@ -361,136 +403,456 @@ class PipelineEngine:
                                 elapsed, str(e))
             self._emit(session_id, "encode", -1, f"Encode failed: {e}")
             traceback.print_exc()
+            for v in list(locals().values()):
+                if isinstance(v, torch.nn.Module):
+                    try:
+                        v.to("meta")
+                    except Exception:
+                        pass
+            gc.collect()
             flush_vram()
+            print(f"  === ENCODE CLEANUP === VRAM after error: {vram_stats()}", flush=True)
             return False
 
     # ─── Step 2: Denoise ────────────────────────────────────────────
     def step_denoise(self, session_id: str) -> bool:
-        """Run two-stage transformer denoising → latents checkpoint."""
+        """Run two-pass transformer denoising → latents checkpoint.
+
+        Memory-optimised architecture:
+        ──────────────────────────────
+        Phase 1: VAE encode only (~0.5 GB VRAM).
+                 Produces latents + condition tensors.  VAE freed.
+        Phase 2: High-noise transformer only (~10 GB RAM + offloaded VRAM).
+                 LoRAs loaded per-pass.  Pass 1 denoising.  Freed.
+        Phase 3: Low-noise transformer only (~10 GB RAM + offloaded VRAM).
+                 LoRAs loaded per-pass.  Pass 2 denoising.  Freed.
+
+        Peak RAM: ~10 GB (one transformer at a time).
+        Peak VRAM: ~14 GB (transformer blocks offloaded, latents + embeds on GPU).
+        """
         info = self.sm.get_session(session_id)
         if not info:
             return False
 
-        # Check prerequisite
         if not self.sm.has_checkpoint(session_id, "embeddings"):
             self._emit(session_id, "denoise", -1,
                        "Missing embeddings checkpoint — run encode first")
             return False
 
         self.sm.update_step(session_id, "denoise", StepStatus.RUNNING)
-        self._emit(session_id, "denoise", 0, "Loading GGUF transformers…")
+        self._emit(session_id, "denoise", 0, "Starting denoise…")
         t0 = time.time()
 
+        # Pre-clean
+        gc.collect()
+        flush_vram()
+        print(f"  === DENOISE START === VRAM: {vram_stats()}  RAM: {ram_stats()}", flush=True)
+
         try:
-            from diffusers import (
-                WanImageToVideoPipeline,
-                AutoencoderKLWan,
-                WanTransformer3DModel,
-                GGUFQuantizationConfig,
-            )
+            from diffusers import WanImageToVideoPipeline
             from diffusers.schedulers import UniPCMultistepScheduler
+            from diffusers.hooks import apply_group_offloading
 
             cfg = self.cfg
             amd = cfg.get("amd", {})
             force_fp16 = amd.get("force_fp16", False)
             dtype = torch.float16 if force_fp16 else torch.bfloat16
+            offload_type = cfg.get("offload_type", "block_level")
+            use_offload = cfg.get("enable_group_offload", True)
+            force_vae_cpu = cfg.get("force_vae_cpu", False)
+            flow_shift = cfg.get("flow_shift", 8.0)
 
-            # Load the full pipeline (needed for the denoise __call__)
-            self._emit(session_id, "denoise", 5, "Loading transformers…")
-            transformer_high, transformer_low = load_transformers(cfg)
+            # Load scheduler config
+            sched = UniPCMultistepScheduler.from_pretrained(
+                cfg["model_id"], subfolder="scheduler",
+            )
+            sched = UniPCMultistepScheduler.from_config(
+                sched.config, flow_shift=flow_shift,
+            )
 
-            self._emit(session_id, "denoise", 15, "Assembling pipeline…")
-            # We need a minimal VAE just for the pipeline structure
-            # (it won't actually run — we intercept after latents)
+            # ══════════════════════════════════════════════════════════
+            #  PHASE 1: VAE encode input image → latents + condition
+            # ══════════════════════════════════════════════════════════
+            self._emit(session_id, "denoise", 3, "Loading VAE…")
             vae = load_vae(cfg)
 
-            pipe = WanImageToVideoPipeline.from_pretrained(
-                cfg["model_id"],
-                transformer=transformer_high,
-                transformer_2=transformer_low,
-                vae=vae,
-                torch_dtype=dtype,
-            )
-
-            flow_shift = cfg.get("flow_shift", 8.0)
-            pipe.scheduler = UniPCMultistepScheduler.from_config(
-                pipe.scheduler.config, flow_shift=flow_shift,
-            )
-
-            # LoRAs (before offloading)
-            self._emit(session_id, "denoise", 20, "Loading LoRAs…")
-            apply_loras(pipe, cfg, info.lora_scales)
-
-            # Offloading
-            if cfg.get("enable_group_offload", True):
-                self._emit(session_id, "denoise", 25, "Setting up offloading…")
-                pipe.to("cpu")
-                setup_offloading(pipe.transformer, cfg)
-                if pipe.transformer_2 is not None:
-                    setup_offloading(pipe.transformer_2, cfg)
-                setup_offloading(pipe.text_encoder, cfg)
-                setup_offloading(pipe.vae, cfg)
-                if pipe.image_encoder is not None:
-                    setup_offloading(pipe.image_encoder, cfg)
-            else:
-                pipe.to("cuda")
-
-            # VAE tiling/slicing
             if cfg.get("vae_tiling", True):
-                pipe.vae.enable_tiling()
+                vae.enable_tiling()
             if cfg.get("vae_slicing", True):
-                pipe.vae.enable_slicing()
+                vae.enable_slicing()
+
+            vae_device = "cpu" if force_vae_cpu else "cuda"
+            vae.to(vae_device)
+            print(f"  VAE on {vae_device}. VRAM: {vram_stats()}", flush=True)
+
+            # Load a temporary transformer ONLY to read config values
+            # (vae_scale_factor_spatial, z_dim, image_dim).  This loads
+            # to CPU/meta and is freed immediately — never touches GPU.
+            self._emit(session_id, "denoise", 6, "Reading model config…")
+            transformer_cfg_reader = load_single_transformer(cfg, "high")
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(
+                cfg["model_id"], subfolder="tokenizer"
+            )
+
+            pipe_vae = WanImageToVideoPipeline(
+                tokenizer=tokenizer,
+                text_encoder=None,
+                transformer=transformer_cfg_reader,
+                vae=vae,
+                scheduler=sched,
+                image_processor=None,
+            )
+
+            vae_scale_factor = pipe_vae.vae_scale_factor_spatial
+            num_channels_latents = vae.config.z_dim
+            image_dim = transformer_cfg_reader.config.image_dim
+
+            # Free config reader immediately — never went to GPU
+            pipe_vae.transformer = None
+            transformer_cfg_reader.to("meta")
+            del transformer_cfg_reader
+            gc.collect()
+            print(f"  Config read done. VRAM: {vram_stats()}  RAM: {ram_stats()}")
 
             # Prepare image
             image = prepare_image(info.input_image, info.width, info.height)
+
+            # Load text embeddings → GPU ONCE (stay there for both passes)
+            embeddings = self.sm.load_checkpoint(session_id, "embeddings")
+            prompt_embeds = embeddings["prompt_embeds"].to(dtype).to("cuda")
+            negative_prompt_embeds = embeddings["negative_prompt_embeds"].to(dtype).to("cuda")
+            del embeddings
 
             # Seed
             seed = info.seed
             if seed < 0:
                 seed = torch.seed() & 0xFFFFFFFF
-            generator = torch.Generator(device="cuda").manual_seed(seed)
+            generator = torch.Generator(device="cpu").manual_seed(seed)
 
-            # Progress callback for denoising steps
-            total_steps = info.num_inference_steps
-            def denoise_cb(pipe_obj, step_idx, timestep, cb_kwargs):
-                if self._cancel_flag:
-                    raise InterruptedError("Generation cancelled by user")
-                pct = 30 + int(65 * (step_idx + 1) / total_steps)
-                self._emit(session_id, "denoise", pct,
-                           f"Denoising step {step_idx + 1}/{total_steps}")
-                return cb_kwargs
+            # Prepare latents (VAE encode)
+            self._emit(session_id, "denoise", 10, "VAE-encoding input image…")
+            print(f"  VRAM before prepare_latents: {vram_stats()}")
 
-            self._emit(session_id, "denoise", 30,
-                       f"Starting denoising: {total_steps} steps…")
+            from diffusers.video_processor import VideoProcessor
+            video_proc = VideoProcessor(vae_scale_factor=vae_scale_factor)
+            image_tensor = video_proc.preprocess(image, height=info.height,
+                                                  width=info.width)
+            image_tensor = image_tensor.to(vae_device, dtype=torch.float32)
 
-            output = pipe(
-                image=image,
-                prompt=info.prompt,
-                negative_prompt=info.negative_prompt,
-                height=info.height,
-                width=info.width,
-                num_frames=info.num_frames,
-                num_inference_steps=info.num_inference_steps,
-                guidance_scale=info.guidance_scale,
-                guidance_scale_2=info.guidance_scale_2,
-                generator=generator,
-                output_type="latent",
-                callback_on_step_end=denoise_cb,
+            try:
+                with torch.no_grad():
+                    latents, condition = pipe_vae.prepare_latents(
+                        image_tensor,
+                        batch_size=1,
+                        num_channels_latents=num_channels_latents,
+                        height=info.height,
+                        width=info.width,
+                        num_frames=info.num_frames,
+                        dtype=torch.float32,
+                        device=vae_device,
+                        generator=generator,
+                    )
+            except torch.OutOfMemoryError:
+                if vae_device == "cuda":
+                    print("  ⚠ OOM during GPU VAE encode; retrying on CPU…", flush=True)
+                    flush_vram()
+                    pipe_vae.vae.to("cpu")
+                    image_tensor = image_tensor.to("cpu")
+                    with torch.no_grad():
+                        latents, condition = pipe_vae.prepare_latents(
+                            image_tensor,
+                            batch_size=1,
+                            num_channels_latents=num_channels_latents,
+                            height=info.height,
+                            width=info.width,
+                            num_frames=info.num_frames,
+                            dtype=torch.float32,
+                            device="cpu",
+                            generator=generator,
+                        )
+                else:
+                    raise
+
+            # Move to GPU in inference dtype
+            latents = latents.to("cuda", dtype=dtype)
+            condition = condition.to("cuda", dtype=dtype)
+            print(f"  VRAM after prepare_latents: {vram_stats()}")
+
+            # Free VAE completely
+            pipe_vae.vae.to("meta")
+            pipe_vae.vae = None
+            del vae, pipe_vae, image_tensor, video_proc
+            gc.collect()
+            flush_vram()
+            print(f"  Freed VAE. VRAM: {vram_stats()}  RAM: {ram_stats()}")
+
+            # CLIP image embeddings (if transformer expects them)
+            image_embeds = None
+            if image_dim is not None:
+                self._emit(session_id, "denoise", 16, "Encoding image (CLIP)…")
+                from transformers import CLIPVisionModel, CLIPImageProcessor
+                img_proc = CLIPImageProcessor.from_pretrained(
+                    cfg["model_id"], subfolder="image_processor"
+                )
+                img_enc = CLIPVisionModel.from_pretrained(
+                    cfg["model_id"], subfolder="image_encoder",
+                    torch_dtype=torch.float32,
+                )
+                img_enc.to("cuda")
+                img_input = img_proc(images=image, return_tensors="pt")
+                img_input = {k: v.to("cuda") for k, v in img_input.items()}
+                with torch.no_grad():
+                    image_embeds = img_enc(**img_input,
+                                          output_hidden_states=True).hidden_states[-2]
+                image_embeds = image_embeds.to(dtype)
+                del img_enc, img_proc, img_input
+                flush_vram()
+                print(f"  Freed CLIP encoder. VRAM: {vram_stats()}")
+
+            # ══════════════════════════════════════════════════════════
+            #  SIGMA SCHEDULE
+            # ══════════════════════════════════════════════════════════
+            steps_per_pass = info.num_inference_steps
+            total_steps = steps_per_pass * 2
+
+            full_sched = UniPCMultistepScheduler.from_config(
+                sched.config, flow_shift=flow_shift,
+            )
+            full_sched.set_timesteps(total_steps)
+            full_sigmas = full_sched.sigmas.numpy().copy()
+
+            pass1_input = full_sigmas[0:steps_per_pass]
+            pass2_input = full_sigmas[steps_per_pass:total_steps]
+            boundary_sigma = float(full_sigmas[steps_per_pass])
+
+            print(f"  Schedule: {steps_per_pass}+{steps_per_pass}={total_steps} steps, "
+                  f"boundary={boundary_sigma:.6f}")
+            print(f"  Sigmas: {[f'{s:.4f}' for s in full_sigmas]}")
+
+            guidance_scale = info.guidance_scale
+            guidance_scale_2 = info.guidance_scale_2
+            do_cfg = guidance_scale > 1.0
+
+            self._emit(session_id, "denoise", 20,
+                       f"Two-pass denoise: {total_steps} total steps")
+            print(f"  VRAM before denoise loops: {vram_stats()}")
+            print(f"  CFG: gs1={guidance_scale}, gs2={guidance_scale_2}")
+
+            # ══════════════════════════════════════════════════════════
+            #  PASS 1: High-noise transformer (load → LoRA → offload → run → free)
+            # ══════════════════════════════════════════════════════════
+            self._emit(session_id, "denoise", 22,
+                       "Pass 1: Loading high-noise transformer…")
+            print(f"  RAM before high-noise load: {ram_stats()}")
+
+            transformer_high = load_single_transformer(cfg, "high")
+            print(f"  RAM after high-noise load: {ram_stats()}")
+
+            # Temporary pipe for LoRA loading API
+            pipe_pass1 = WanImageToVideoPipeline(
+                tokenizer=tokenizer,
+                text_encoder=None,
+                transformer=transformer_high,
+                vae=None,
+                scheduler=sched,
+                image_processor=None,
             )
 
-            latents = output.frames  # raw latent tensor when output_type="latent"
+            # LoRAs for high-noise ONLY
+            self._emit(session_id, "denoise", 24, "Loading high-noise LoRAs…")
+            apply_loras_to_transformer(pipe_pass1, cfg, "transformer",
+                                       info.lora_scales)
+            print(f"  VRAM after high-noise LoRAs: {vram_stats()}")
 
-            # Save latents checkpoint
+            # Group offloading
+            if use_offload:
+                num_blocks = cfg.get("num_blocks_per_group", 1)
+                print(f"  Setting up {offload_type} offloading for high-noise (num_blocks_per_group={num_blocks})…")
+                offload_kwargs = dict(
+                    offload_type=offload_type,
+                    offload_device=torch.device("cpu"),
+                    onload_device=torch.device("cuda"),
+                    use_stream=False,
+                )
+                if offload_type == "block_level":
+                    offload_kwargs["num_blocks_per_group"] = num_blocks
+                apply_group_offloading(pipe_pass1.transformer, **offload_kwargs)
+                print(f"  VRAM after offload setup: {vram_stats()}")
+
+            # Scheduler
+            sched_high = UniPCMultistepScheduler.from_config(
+                sched.config, flow_shift=1.0,
+            )
+            sched_high.set_timesteps(sigmas=pass1_input, device="cpu")
+            sched_high.sigmas[-1] = boundary_sigma
+            timesteps_high = sched_high.timesteps
+            print(f"  Pass 1 timesteps: {timesteps_high.tolist()}")
+
+            # ── Denoise loop (Pass 1) ──
+            current_model = pipe_pass1.transformer
+            for i, t in enumerate(timesteps_high):
+                if self._cancel_flag:
+                    raise InterruptedError("Generation cancelled by user")
+
+                pct = 25 + int(25 * (i + 1) / steps_per_pass)
+                gpu_gb = vram_stats().get("allocated_gb", 0)
+                self._emit(session_id, "denoise", pct,
+                           f"Pass 1 step {i+1}/{steps_per_pass} "
+                           f"(t={t:.0f}, GPU: {gpu_gb:.1f} GB)")
+
+                latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
+                timestep = t.expand(latents.shape[0])
+
+                with torch.no_grad():
+                    with current_model.cache_context("cond"):
+                        noise_pred = current_model(
+                            hidden_states=latent_model_input,
+                            timestep=timestep,
+                            encoder_hidden_states=prompt_embeds,
+                            encoder_hidden_states_image=image_embeds,
+                            return_dict=False,
+                        )[0]
+
+                    if do_cfg:
+                        with current_model.cache_context("uncond"):
+                            noise_uncond = current_model(
+                                hidden_states=latent_model_input,
+                                timestep=timestep,
+                                encoder_hidden_states=negative_prompt_embeds,
+                                encoder_hidden_states_image=image_embeds,
+                                return_dict=False,
+                            )[0]
+                        noise_pred = noise_uncond + guidance_scale * (
+                            noise_pred - noise_uncond)
+
+                latents = sched_high.step(noise_pred, t, latents,
+                                          return_dict=False)[0]
+
+            print(f"  Pass 1 complete. VRAM: {vram_stats()}")
+
+            # ── Free high-noise transformer completely ──
+            remove_offloading(pipe_pass1.transformer)
+            pipe_pass1.transformer.to("meta")
+            pipe_pass1.transformer = None
+            del pipe_pass1, current_model, transformer_high
+            gc.collect()
+            flush_vram()
+            print(f"  Freed high-noise. VRAM: {vram_stats()}  RAM: {ram_stats()}")
+
+            # ══════════════════════════════════════════════════════════
+            #  PASS 2: Low-noise transformer (load → LoRA → offload → run → free)
+            # ══════════════════════════════════════════════════════════
+            self._emit(session_id, "denoise", 52,
+                       "Pass 2: Loading low-noise transformer…")
+            print(f"  RAM before low-noise load: {ram_stats()}")
+
+            transformer_low = load_single_transformer(cfg, "low")
+            print(f"  RAM after low-noise load: {ram_stats()}")
+
+            pipe_pass2 = WanImageToVideoPipeline(
+                tokenizer=tokenizer,
+                text_encoder=None,
+                transformer=None,
+                transformer_2=transformer_low,
+                vae=None,
+                scheduler=sched,
+                image_processor=None,
+            )
+
+            # LoRAs for low-noise ONLY
+            self._emit(session_id, "denoise", 54, "Loading low-noise LoRAs…")
+            apply_loras_to_transformer(pipe_pass2, cfg, "transformer_2",
+                                       info.lora_scales)
+            print(f"  VRAM after low-noise LoRAs: {vram_stats()}")
+
+            # Group offloading
+            if use_offload:
+                num_blocks = cfg.get("num_blocks_per_group", 1)
+                print(f"  Setting up {offload_type} offloading for low-noise (num_blocks_per_group={num_blocks})…")
+                offload_kwargs = dict(
+                    offload_type=offload_type,
+                    offload_device=torch.device("cpu"),
+                    onload_device=torch.device("cuda"),
+                    use_stream=False,
+                )
+                if offload_type == "block_level":
+                    offload_kwargs["num_blocks_per_group"] = num_blocks
+                apply_group_offloading(pipe_pass2.transformer_2, **offload_kwargs)
+                print(f"  VRAM after offload setup: {vram_stats()}")
+
+            # Scheduler
+            sched_low = UniPCMultistepScheduler.from_config(
+                sched.config, flow_shift=1.0,
+            )
+            sched_low.set_timesteps(sigmas=pass2_input, device="cpu")
+            timesteps_low = sched_low.timesteps
+            print(f"  Pass 2 timesteps: {timesteps_low.tolist()}")
+
+            do_cfg_2 = guidance_scale_2 > 1.0
+            current_model = pipe_pass2.transformer_2
+
+            # ── Denoise loop (Pass 2) ──
+            for i, t in enumerate(timesteps_low):
+                if self._cancel_flag:
+                    raise InterruptedError("Generation cancelled by user")
+
+                pct = 52 + int(43 * (i + 1) / steps_per_pass)
+                gpu_gb = vram_stats().get("allocated_gb", 0)
+                self._emit(session_id, "denoise", pct,
+                           f"Pass 2 step {i+1}/{steps_per_pass} "
+                           f"(t={t:.0f}, GPU: {gpu_gb:.1f} GB)")
+
+                latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
+                timestep = t.expand(latents.shape[0])
+
+                with torch.no_grad():
+                    with current_model.cache_context("cond"):
+                        noise_pred = current_model(
+                            hidden_states=latent_model_input,
+                            timestep=timestep,
+                            encoder_hidden_states=prompt_embeds,
+                            encoder_hidden_states_image=image_embeds,
+                            return_dict=False,
+                        )[0]
+
+                    if do_cfg_2:
+                        with current_model.cache_context("uncond"):
+                            noise_uncond = current_model(
+                                hidden_states=latent_model_input,
+                                timestep=timestep,
+                                encoder_hidden_states=negative_prompt_embeds,
+                                encoder_hidden_states_image=image_embeds,
+                                return_dict=False,
+                            )[0]
+                        noise_pred = noise_uncond + guidance_scale_2 * (
+                            noise_pred - noise_uncond)
+
+                latents = sched_low.step(noise_pred, t, latents,
+                                         return_dict=False)[0]
+
+            print(f"  Pass 2 complete. VRAM: {vram_stats()}")
+
+            # ── Save result ──
             self.sm.save_checkpoint(session_id, "latents", latents.cpu())
 
             # Free everything
-            del pipe, transformer_high, transformer_low, vae, output
+            remove_offloading(pipe_pass2.transformer_2)
+            pipe_pass2.transformer_2.to("meta")
+            pipe_pass2.transformer_2 = None
+            del pipe_pass2, current_model, transformer_low
+            del latents, condition, prompt_embeds, negative_prompt_embeds
+            if image_embeds is not None:
+                del image_embeds
+            gc.collect()
             flush_vram()
 
             elapsed = time.time() - t0
             self.sm.update_step(session_id, "denoise", StepStatus.DONE, elapsed)
             self._emit(session_id, "denoise", 100,
-                       f"Denoising done in {elapsed:.1f}s")
+                       f"Denoising done in {elapsed:.1f}s ({total_steps} steps)")
+            print(f"  === DENOISE DONE === VRAM: {vram_stats()}  RAM: {ram_stats()}",
+                  flush=True)
             return True
 
         except InterruptedError:
@@ -498,6 +860,13 @@ class PipelineEngine:
             self.sm.update_step(session_id, "denoise", StepStatus.FAILED,
                                 elapsed, "Cancelled by user")
             self._emit(session_id, "denoise", -1, "Cancelled")
+            for v in list(locals().values()):
+                if isinstance(v, torch.nn.Module):
+                    try:
+                        v.to("meta")
+                    except Exception:
+                        pass
+            gc.collect()
             flush_vram()
             return False
 
@@ -507,7 +876,15 @@ class PipelineEngine:
                                 elapsed, str(e))
             self._emit(session_id, "denoise", -1, f"Denoise failed: {e}")
             traceback.print_exc()
+            for v in list(locals().values()):
+                if isinstance(v, torch.nn.Module):
+                    try:
+                        v.to("meta")
+                    except Exception:
+                        pass
+            gc.collect()
             flush_vram()
+            print(f"  === DENOISE CLEANUP === VRAM: {vram_stats()}", flush=True)
             return False
 
     # ─── Step 3: VAE Decode ─────────────────────────────────────────
@@ -528,8 +905,6 @@ class PipelineEngine:
 
         try:
             cfg = self.cfg
-
-            # Load VAE only
             vae = load_vae(cfg)
 
             if cfg.get("vae_tiling", True):
@@ -537,55 +912,42 @@ class PipelineEngine:
             if cfg.get("vae_slicing", True):
                 vae.enable_slicing()
 
-            if cfg.get("enable_group_offload", True):
-                vae.to("cpu")
-                setup_offloading(vae, cfg)
-            else:
-                vae.to("cuda")
+            vae.to("cuda")
 
-            # Load latents
             self._emit(session_id, "vae_decode", 20, "Loading latents…")
             latents = self.sm.load_checkpoint(session_id, "latents")
+            latents = latents.to("cuda", dtype=torch.float32)
 
-            if cfg.get("enable_group_offload", True):
-                latents = latents.to("cpu")
-            else:
-                latents = latents.to("cuda")
-
-            # Decode
             self._emit(session_id, "vae_decode", 30, "Decoding latents → frames…")
 
-            # Get the vae scaling factor from config
-            latent_mean = torch.tensor(vae.config.get("latents_mean", None))
-            latent_std = torch.tensor(vae.config.get("latents_std", None))
+            latents_mean = getattr(vae.config, "latents_mean", None)
+            latents_std = getattr(vae.config, "latents_std", None)
 
-            # Unscale latents if needed
-            if latent_std is not None and latent_mean is not None:
-                latent_mean = latent_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-                latent_std = latent_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+            if latents_mean is not None and latents_std is not None:
+                latent_mean = torch.tensor(latents_mean).view(1, -1, 1, 1, 1).to(
+                    latents.device, latents.dtype)
+                latent_std = torch.tensor(latents_std).view(1, -1, 1, 1, 1).to(
+                    latents.device, latents.dtype)
                 latents = latents * latent_std + latent_mean
             else:
                 scaling = getattr(vae.config, "scaling_factor", 1.0)
-                latents = latents / scaling
+                if scaling != 1.0:
+                    latents = latents / scaling
 
             with torch.no_grad():
                 frames_tensor = vae.decode(latents).sample
 
-            # Clamp + convert to uint8 PIL frames
             frames_tensor = frames_tensor.clamp(-1, 1)
             frames_tensor = ((frames_tensor + 1) / 2 * 255).to(torch.uint8)
-            # Shape: [B, C, T, H, W] → list of PIL images
-            frames_tensor = frames_tensor[0].permute(1, 2, 3, 0).cpu()  # [T, H, W, C]
+            frames_tensor = frames_tensor[0].permute(1, 2, 3, 0).cpu()
 
-            # Save frames as numpy for easy video export
             frames_np = frames_tensor.numpy()
-            self.sm.save_checkpoint(session_id, "frames", torch.from_numpy(frames_np))
+            self.sm.save_checkpoint(session_id, "frames",
+                                    torch.from_numpy(frames_np))
 
-            # Free VAE
             del vae, latents, frames_tensor
             flush_vram()
 
-            # Generate preview video
             self._emit(session_id, "vae_decode", 90, "Saving preview…")
             self._export_preview(session_id, frames_np, info.fps)
 
@@ -614,6 +976,10 @@ class PipelineEngine:
         for frame in frames_np:
             writer.append_data(frame)
         writer.close()
+        info = self.sm.get_session(session_id)
+        if info and "preview.mp4" not in info.checkpoints:
+            info.checkpoints.append("preview.mp4")
+            self.sm._save_meta(info)
 
     # ─── Step 4: Export ─────────────────────────────────────────────
     def step_export(self, session_id: str) -> bool:
@@ -637,9 +1003,8 @@ class PipelineEngine:
             frames_tensor = self.sm.load_checkpoint(session_id, "frames")
             frames_np = frames_tensor.numpy()
 
-            # Export high-quality video
             sdir = self.sm.session_dir(session_id)
-            video_path = sdir / "video.mp4"
+            video_path = sdir / "output.mp4"
 
             self._emit(session_id, "export", 30, "Encoding video…")
 
@@ -651,10 +1016,14 @@ class PipelineEngine:
                 writer.append_data(frame)
             writer.close()
 
-            # Also copy to output dir with timestamp
+            info = self.sm.get_session(session_id)
+            if info and "output.mp4" not in info.checkpoints:
+                info.checkpoints.append("output.mp4")
+                self.sm._save_meta(info)
+
+            import shutil
             output_dir = Path("output")
             output_dir.mkdir(exist_ok=True)
-            import shutil
             final_name = f"video_{info.session_id}.mp4"
             final_path = output_dir / final_name
             shutil.copy2(video_path, final_path)
@@ -685,7 +1054,7 @@ class PipelineEngine:
             self._emit(session_id, "upscale", 100, "Upscale skipped")
             return True
 
-        video_path = self.sm.get_file_path(session_id, "video.mp4")
+        video_path = self.sm.get_file_path(session_id, "output.mp4")
         if not video_path:
             self._emit(session_id, "upscale", -1,
                        "Missing video file — run export first")
@@ -699,8 +1068,18 @@ class PipelineEngine:
             from upscale import upscale_video
 
             sdir = self.sm.session_dir(session_id)
-            up_path = str(sdir / "video_upscaled.mp4")
-            upscale_video(str(video_path), up_path, self.cfg)
+            up_path = str(sdir / "output_upscaled.mp4")
+
+            upscale_cfg = dict(self.cfg)
+            upscale_cfg["fps"] = info.fps
+            upscale_cfg["output_fps"] = getattr(info, "output_fps", info.fps)
+
+            upscale_video(str(video_path), up_path, upscale_cfg)
+
+            info_up = self.sm.get_session(session_id)
+            if info_up and "output_upscaled.mp4" not in info_up.checkpoints:
+                info_up.checkpoints.append("output_upscaled.mp4")
+                self.sm._save_meta(info_up)
 
             elapsed = time.time() - t0
             self.sm.update_step(session_id, "upscale", StepStatus.DONE, elapsed)
@@ -720,10 +1099,7 @@ class PipelineEngine:
 
     # ─── Run all steps (or from a given step) ───────────────────────
     def run_from_step(self, session_id: str, start_step: str = "encode") -> bool:
-        """
-        Run the pipeline starting from a specific step.
-        Steps before start_step must have their checkpoints available.
-        """
+        """Run the pipeline starting from a specific step."""
         self._cancel_flag = False
         info = self.sm.get_session(session_id)
         if not info:
@@ -748,11 +1124,9 @@ class PipelineEngine:
 
             success = step_funcs[step_name](session_id)
             if not success:
-                # Step either failed or was skipped
                 info = self.sm.get_session(session_id)
                 if info and info.steps.get(step_name) == StepStatus.FAILED:
                     return False
-                # If skipped, continue
 
         self.sm.update_status(session_id, "done")
         return True
@@ -763,7 +1137,6 @@ class PipelineEngine:
         if not info:
             return "encode"
 
-        # Check checkpoints in reverse order to find last completed step
         if self.sm.has_checkpoint(session_id, "frames"):
             return "export"
         if self.sm.has_checkpoint(session_id, "latents"):

@@ -87,34 +87,44 @@ width: 832
 height: 480
 num_frames: 81         # 4k+1 rule → (81-1)/4 = 20 latent frames
 fps: 16
+duration: 5.0          # Video length in seconds (frames auto-calculated from duration × fps)
+output_fps: 24         # Output framerate after RIFE interpolation (0 = same as fps)
 
 # ─── Sampler / scheduler ───────────────────────────────────────────
-num_inference_steps: 8      # LightX2V allows 4-8 steps
-guidance_scale: 1.0         # CFG=1 for distilled LoRAs (no classifier-free guidance)
-guidance_scale_2: 1.0       # Low-noise stage CFG
+num_inference_steps: 8      # Steps PER PASS (total = 2× this: 8 high + 8 low = 16)
+guidance_scale: 2.0         # CFG for high-noise pass (matches ComfyUI KSampler cfg)
+guidance_scale_2: 2.0       # CFG for low-noise pass
 flow_shift: 8.0             # 8.0 for I2V (5.0 for 720p T2V, 3.0 for 480p T2V)
 seed: 42                    # -1 for random
 
 # ─── Two-stage boundary ────────────────────────────────────────────
-# Wan 2.2 I2V default: 0.9 (90% high-noise → 10% low-noise)
-# With 8 steps: steps 0-6 = high-noise transformer, steps 7 = low-noise transformer_2
-boundary_ratio: 0.9
+# ComfyUI flow: TWO KSampler nodes, each 8 steps, chained:
+#   Node 1 (high-noise): 8 steps, sigmas from 1.0 → boundary
+#   Node 2 (low-noise):  8 steps, sigmas from boundary → 0.0
+# boundary_ratio = 0.5 means the split is at 50% of the sigma range
+# With 8 steps per pass, total = 16 denoising steps
+boundary_ratio: 0.5
 
 # ─── Memory management ─────────────────────────────────────────────
 # group_offload: moves transformer blocks CPU↔GPU on-the-fly
 # Drastically cuts peak VRAM (24GB → ~14GB usable for 14B model)
 enable_group_offload: true
-offload_type: "leaf_level"   # "leaf_level" (most granular) or "block_level"
-use_stream: true             # async copy via HIP streams (AMD-optimised)
+offload_type: "block_level"  # "block_level" (fewer PCIe transfers, better GPU util) or "leaf_level"
+num_blocks_per_group: 1      # For block_level: how many transformer blocks per group (1=minimal VRAM, higher=faster)
+use_stream: false            # MUST be false for AMD/HIP (CUDA streams broken on ROCm)
 
 # ─── VAE settings ──────────────────────────────────────────────────
 # VAE must stay float32 for quality; we tile it to fit in VRAM
 vae_tiling: true
 vae_slicing: true
+# Force VAE encode/decode on CPU to avoid GPU OOM during latent prep.
+# Slower but guarantees no VRAM spike.  Set false for faster GPU VAE.
+force_vae_cpu: false
 
 # ─── Upscale (optional, post-generation) ───────────────────────────
 enable_upscale: false
 upscale_model: "models/upscale_models/4x_NMKD-Siax_200k.pth"
+rife_model: "models/upscale_models/rife47.pth"
 
 # ─── AMD-specific tuning ───────────────────────────────────────────
 amd:
