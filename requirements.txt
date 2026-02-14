@@ -1,0 +1,30 @@
+# ─── Core ML ────────────────────────────────────────────────────────
+# Install from git main for latest GGUF + group offloading + LoRA fixes
+git+https://github.com/huggingface/diffusers.git@main
+transformers>=4.47.0
+accelerate>=1.2.0
+safetensors>=0.5.0
+peft>=0.14.0
+
+# ─── GGUF quantized model support ──────────────────────────────────
+gguf>=0.10.0
+
+# ─── Text encoder (UMT5-XXL) ───────────────────────────────────────
+sentencepiece
+protobuf
+
+# ─── Image / Video I/O ─────────────────────────────────────────────
+Pillow>=10.0
+imageio>=2.34
+imageio-ffmpeg>=0.5
+numpy>=1.26
+
+# ─── Prompt helpers ────────────────────────────────────────────────
+ftfy
+
+# ─── Config ─────────────────────────────────────────────────────────
+pyyaml
+tqdm
+
+# ─── Web UI ─────────────────────────────────────────────────────────
+flask>=3.0

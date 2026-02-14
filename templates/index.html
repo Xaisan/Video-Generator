@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Wan 2.2 I2V — Video Generator</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- ─── Sidebar ─────────────────────────────────────────── -->
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <h2>Sessions</h2>
+        <button id="btn-new" class="btn btn-sm btn-primary" title="New generation">+ New</button>
+      </div>
+      <div id="session-list" class="session-list"></div>
+      <div class="sidebar-footer">
+        <div id="vram-bar" class="vram-bar">
+          <div class="vram-fill" style="width:0%"></div>
+          <span class="vram-label">VRAM: —</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ─── Main ────────────────────────────────────────────── -->
+    <main id="main">
+      <!-- Panel: New/Resume Generation -->
+      <section id="panel-generate" class="panel">
+        <h1>Image-to-Video Generation</h1>
+
+        <div class="form-grid">
+          <!-- Left column: Image upload -->
+          <div class="form-col">
+            <div class="form-group">
+              <label>Input Image</label>
+              <div id="drop-zone" class="drop-zone">
+                <img id="preview-img" src="" alt="" style="display:none" />
+                <p id="drop-text">Drop image here or click to browse</p>
+                <input type="file" id="file-input" accept="image/*" style="display:none" />
+              </div>
+              <input type="hidden" id="input-image-path" value="" />
+            </div>
+          </div>
+
+          <!-- Right column: Parameters -->
+          <div class="form-col">
+            <div class="form-group">
+              <label for="prompt">Prompt</label>
+              <textarea id="prompt" rows="3" placeholder="Describe the video motion...">{{ config.get('prompt', '') }}</textarea>
+            </div>
+            <div class="form-group">
+              <label for="negative-prompt">Negative Prompt</label>
+              <textarea id="negative-prompt" rows="2" placeholder="Things to avoid...">{{ config.get('negative_prompt', '') }}</textarea>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label for="width">Width</label>
+                <input type="number" id="width" value="{{ config.get('width', 832) }}" min="128" max="1920" step="16" />
+              </div>
+              <div class="form-group">
+                <label for="height">Height</label>
+                <input type="number" id="height" value="{{ config.get('height', 480) }}" min="128" max="1080" step="16" />
+              </div>
+              <div class="form-group">
+                <label for="num-frames">Frames</label>
+                <input type="number" id="num-frames" value="{{ config.get('num_frames', 81) }}" min="1" max="241" step="4" />
+              </div>
+              <div class="form-group">
+                <label for="fps">FPS</label>
+                <input type="number" id="fps" value="{{ config.get('fps', 16) }}" min="1" max="60" />
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label for="steps">Steps</label>
+                <input type="number" id="steps" value="{{ config.get('num_inference_steps', 8) }}" min="1" max="100" />
+              </div>
+              <div class="form-group">
+                <label for="cfg">CFG Scale</label>
+                <input type="number" id="cfg" value="{{ config.get('guidance_scale', 1.0) }}" min="0" max="20" step="0.1" />
+              </div>
+              <div class="form-group">
+                <label for="cfg2">CFG Scale 2</label>
+                <input type="number" id="cfg2" value="{{ config.get('guidance_scale_2', 1.0) }}" min="0" max="20" step="0.1" />
+              </div>
+              <div class="form-group">
+                <label for="flow-shift">Flow Shift</label>
+                <input type="number" id="flow-shift" value="{{ config.get('flow_shift', 8.0) }}" min="0" max="30" step="0.5" />
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label for="seed">Seed</label>
+                <input type="number" id="seed" value="{{ config.get('seed', 42) }}" min="-1" max="999999999" />
+                <button class="btn btn-xs btn-ghost" onclick="document.getElementById('seed').value=Math.floor(Math.random()*999999999)">🎲</button>
+              </div>
+              <div class="form-group chk">
+                <label>
+                  <input type="checkbox" id="enable-upscale" />
+                  Enable 4× Upscale
+                </label>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- LoRA scales -->
+        <details class="lora-section" open>
+          <summary>LoRA Weights</summary>
+          <div id="lora-scales" class="lora-grid">
+            {% for lora in loras %}
+            <div class="form-group lora-item">
+              <label title="{{ lora.path }}">{{ lora.path | basename }}</label>
+              <input type="number" class="lora-scale" data-lora="{{ loop.index0 }}"
+                     value="{{ lora.scale }}" min="0" max="10" step="0.1" />
+            </div>
+            {% endfor %}
+          </div>
+        </details>
+
+        <div class="form-actions">
+          <button id="btn-generate" class="btn btn-primary btn-lg">🚀 Generate</button>
+        </div>
+      </section>
+
+      <!-- Panel: Session Detail / Progress -->
+      <section id="panel-session" class="panel" style="display:none">
+        <div class="session-header">
+          <h2 id="session-title">Session</h2>
+          <div class="session-actions">
+            <button id="btn-cancel" class="btn btn-danger btn-sm" style="display:none">⏹ Cancel</button>
+            <button id="btn-back" class="btn btn-ghost btn-sm">← Back</button>
+            <button id="btn-delete-session" class="btn btn-danger btn-sm">🗑 Delete</button>
+          </div>
+        </div>
+
+        <!-- Step progress -->
+        <div id="step-pipeline" class="step-pipeline">
+          {% for step in step_order %}
+          <div class="step-card" data-step="{{ step }}">
+            <div class="step-icon">●</div>
+            <div class="step-name">{{ step }}</div>
+            <div class="step-status">pending</div>
+            <div class="step-time"></div>
+            <button class="btn btn-xs btn-ghost btn-resume" data-step="{{ step }}" title="Resume from this step">▶</button>
+          </div>
+          {% endfor %}
+        </div>
+
+        <!-- Progress bar -->
+        <div id="progress-section" class="progress-section" style="display:none">
+          <div class="progress-bar">
+            <div id="progress-fill" class="progress-fill" style="width:0%"></div>
+          </div>
+          <div id="progress-msg" class="progress-msg">Waiting…</div>
+        </div>
+
+        <!-- Session info -->
+        <div id="session-info" class="session-info">
+          <div class="info-grid">
+            <div><strong>Prompt:</strong> <span id="info-prompt">—</span></div>
+            <div><strong>Size:</strong> <span id="info-size">—</span></div>
+            <div><strong>Steps:</strong> <span id="info-steps">—</span></div>
+            <div><strong>Seed:</strong> <span id="info-seed">—</span></div>
+            <div><strong>CFG:</strong> <span id="info-cfg">—</span></div>
+            <div><strong>Status:</strong> <span id="info-status">—</span></div>
+            <div><strong>Error:</strong> <span id="info-error" class="error-text">—</span></div>
+          </div>
+        </div>
+
+        <!-- Video preview -->
+        <div id="video-section" class="video-section" style="display:none">
+          <h3>Output</h3>
+          <video id="video-player" controls loop muted></video>
+          <div class="video-actions">
+            <a id="video-download" href="#" class="btn btn-sm btn-primary" download>⬇ Download</a>
+            <a id="video-download-upscaled" href="#" class="btn btn-sm btn-primary" download style="display:none">⬇ Download Upscaled</a>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

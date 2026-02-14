@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""
+Web UI for Wan 2.2 I2V Video Generator.
+Flask + Server-Sent Events for real-time progress.
+"""
+
+import json
+import os
+import queue
+import threading
+import time
+import uuid
+from pathlib import Path
+
+import yaml
+from flask import (
+    Flask, render_template, request, jsonify, Response,
+    send_from_directory, redirect, url_for,
+)
+from werkzeug.utils import secure_filename
+
+from session_manager import SessionManager, StepStatus, STEP_ORDER
+from pipeline_engine import PipelineEngine, vram_stats, flush_vram, load_config
+
+app = Flask(__name__, static_folder="static", template_folder="templates")
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB uploads
+
+# Custom Jinja2 filter for path basenames
+app.jinja_env.filters["basename"] = lambda p: os.path.basename(p) if p else ""
+
+UPLOAD_DIR = Path("input")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# ─── Global state ──────────────────────────────────────────────────
+sm = SessionManager()
+engine: PipelineEngine | None = None
+cfg: dict = {}
+
+# SSE event queues per client
+sse_clients: dict[str, queue.Queue] = {}
+# Active generation thread
+active_thread: threading.Thread | None = None
+active_session_id: str | None = None
+generation_lock = threading.Lock()
+
+
+def get_engine() -> PipelineEngine:
+    global engine
+    if engine is None:
+        engine = PipelineEngine()
+    return engine
+
+
+def get_cfg() -> dict:
+    global cfg
+    if not cfg:
+        cfg = load_config()
+    return cfg
+
+
+# ─── SSE broadcasting ──────────────────────────────────────────────
+def broadcast_event(event_type: str, data: dict):
+    """Send an event to all connected SSE clients."""
+    msg = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+    dead = []
+    for client_id, q in sse_clients.items():
+        try:
+            q.put_nowait(msg)
+        except queue.Full:
+            dead.append(client_id)
+    for cid in dead:
+        sse_clients.pop(cid, None)
+
+
+def progress_callback(session_id: str, step: str, pct: float, msg: str):
+    """Called by the pipeline engine to broadcast progress."""
+    broadcast_event("progress", {
+        "session_id": session_id,
+        "step": step,
+        "percent": pct,
+        "message": msg,
+        "vram": vram_stats(),
+    })
+
+
+# ─── Routes: Pages ─────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    sessions = sm.list_sessions(limit=100)
+    config = get_cfg()
+    loras = config.get("loras", [])
+    return render_template("index.html",
+                           sessions=[s.to_dict() for s in sessions],
+                           config=config,
+                           loras=loras,
+                           step_order=STEP_ORDER)
+
+
+# ─── Routes: API ───────────────────────────────────────────────────
+
+@app.route("/api/sessions", methods=["GET"])
+def api_list_sessions():
+    sessions = sm.list_sessions(limit=100)
+    return jsonify([s.to_dict() for s in sessions])
+
+
+@app.route("/api/sessions/<session_id>", methods=["GET"])
+def api_get_session(session_id):
+    info = sm.get_session(session_id)
+    if not info:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify(info.to_dict())
+
+
+@app.route("/api/sessions/<session_id>", methods=["DELETE"])
+def api_delete_session(session_id):
+    if sm.delete_session(session_id):
+        return jsonify({"ok": True})
+    return jsonify({"error": "Session not found"}), 404
+
+
+@app.route("/api/upload", methods=["POST"])
+def api_upload_image():
+    """Upload an input image and return its path."""
+    if "image" not in request.files:
+        return jsonify({"error": "No image file"}), 400
+    f = request.files["image"]
+    if not f.filename:
+        return jsonify({"error": "Empty filename"}), 400
+
+    fname = secure_filename(f.filename)
+    # Add unique prefix to avoid collisions
+    fname = f"{int(time.time())}_{fname}"
+    path = UPLOAD_DIR / fname
+    f.save(str(path))
+    return jsonify({"path": str(path), "filename": fname})
+
+
+@app.route("/api/generate", methods=["POST"])
+def api_generate():
+    """Start a new generation session."""
+    global active_thread, active_session_id
+
+    if not generation_lock.acquire(blocking=False):
+        return jsonify({"error": "A generation is already running"}), 409
+
+    try:
+        data = request.json or {}
+
+        # Merge config defaults with request data
+        config = get_cfg()
+        params = {
+            "prompt": data.get("prompt", config.get("prompt", "")),
+            "negative_prompt": data.get("negative_prompt", config.get("negative_prompt", "")),
+            "input_image": data.get("input_image", ""),
+            "width": int(data.get("width", config.get("width", 832))),
+            "height": int(data.get("height", config.get("height", 480))),
+            "num_frames": int(data.get("num_frames", config.get("num_frames", 81))),
+            "num_inference_steps": int(data.get("num_inference_steps", config.get("num_inference_steps", 8))),
+            "guidance_scale": float(data.get("guidance_scale", config.get("guidance_scale", 1.0))),
+            "guidance_scale_2": float(data.get("guidance_scale_2", config.get("guidance_scale_2", 1.0))),
+            "flow_shift": float(data.get("flow_shift", config.get("flow_shift", 8.0))),
+            "seed": int(data.get("seed", config.get("seed", 42))),
+            "fps": int(data.get("fps", config.get("fps", 16))),
+            "enable_upscale": data.get("enable_upscale", False),
+            "lora_scales": data.get("lora_scales", []),
+        }
+
+        # Validate input image
+        if not params["input_image"] or not os.path.isfile(params["input_image"]):
+            generation_lock.release()
+            return jsonify({"error": "Input image not found"}), 400
+
+        # Snap dimensions to mod 16
+        params["width"] = (params["width"] // 16) * 16
+        params["height"] = (params["height"] // 16) * 16
+
+        # Create session
+        session = sm.create_session(params)
+        active_session_id = session.session_id
+
+        # Run in background thread
+        eng = get_engine()
+        eng.set_progress_callback(progress_callback)
+
+        def run():
+            global active_thread, active_session_id
+            try:
+                eng.run_from_step(session.session_id, "encode")
+            finally:
+                active_session_id = None
+                active_thread = None
+                generation_lock.release()
+                broadcast_event("generation_complete", {
+                    "session_id": session.session_id,
+                    "session": sm.get_session(session.session_id).to_dict(),
+                })
+
+        active_thread = threading.Thread(target=run, daemon=True)
+        active_thread.start()
+
+        return jsonify({
+            "session_id": session.session_id,
+            "status": "started",
+        })
+
+    except Exception as e:
+        generation_lock.release()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/resume/<session_id>", methods=["POST"])
+def api_resume(session_id):
+    """Resume a session from a specific step."""
+    global active_thread, active_session_id
+
+    info = sm.get_session(session_id)
+    if not info:
+        return jsonify({"error": "Session not found"}), 404
+
+    if not generation_lock.acquire(blocking=False):
+        return jsonify({"error": "A generation is already running"}), 409
+
+    try:
+        data = request.json or {}
+        start_step = data.get("from_step", "")
+
+        # If no step specified, auto-detect
+        eng = get_engine()
+        if not start_step:
+            start_step = eng.get_resume_step(session_id)
+
+        # Allow updating parameters before resume
+        if "prompt" in data:
+            info.prompt = data["prompt"]
+        if "negative_prompt" in data:
+            info.negative_prompt = data["negative_prompt"]
+        if "seed" in data:
+            info.seed = int(data["seed"])
+        if "num_inference_steps" in data:
+            info.num_inference_steps = int(data["num_inference_steps"])
+        if "guidance_scale" in data:
+            info.guidance_scale = float(data["guidance_scale"])
+        if "guidance_scale_2" in data:
+            info.guidance_scale_2 = float(data["guidance_scale_2"])
+        if "lora_scales" in data:
+            info.lora_scales = data["lora_scales"]
+        if "enable_upscale" in data:
+            info.enable_upscale = bool(data["enable_upscale"])
+
+        # Reset steps from start_step onwards
+        start_idx = STEP_ORDER.index(start_step) if start_step in STEP_ORDER else 0
+        for step_name in STEP_ORDER[start_idx:]:
+            info.steps[step_name] = StepStatus.PENDING
+        info.status = "running"
+        info.error_message = ""
+        info.updated_at = time.time()
+        sm._save_meta(info)
+
+        active_session_id = session_id
+        eng.set_progress_callback(progress_callback)
+
+        def run():
+            global active_thread, active_session_id
+            try:
+                eng.run_from_step(session_id, start_step)
+            finally:
+                active_session_id = None
+                active_thread = None
+                generation_lock.release()
+                broadcast_event("generation_complete", {
+                    "session_id": session_id,
+                    "session": sm.get_session(session_id).to_dict(),
+                })
+
+        active_thread = threading.Thread(target=run, daemon=True)
+        active_thread.start()
+
+        return jsonify({
+            "session_id": session_id,
+            "from_step": start_step,
+            "status": "resumed",
+        })
+
+    except Exception as e:
+        generation_lock.release()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cancel", methods=["POST"])
+def api_cancel():
+    """Cancel the currently running generation."""
+    eng = get_engine()
+    eng.cancel()
+    return jsonify({"ok": True, "message": "Cancel requested"})
+
+
+@app.route("/api/vram", methods=["GET"])
+def api_vram():
+    return jsonify(vram_stats())
+
+
+@app.route("/api/config", methods=["GET"])
+def api_config():
+    return jsonify(get_cfg())
+
+
+# ─── SSE endpoint ──────────────────────────────────────────────────
+
+@app.route("/api/events")
+def api_events():
+    """Server-Sent Events stream for real-time progress."""
+    client_id = str(uuid.uuid4())
+    q = queue.Queue(maxsize=200)
+    sse_clients[client_id] = q
+
+    def stream():
+        try:
+            # Send initial ping
+            yield f"event: connected\ndata: {json.dumps({'client_id': client_id})}\n\n"
+            while True:
+                try:
+                    msg = q.get(timeout=30)
+                    yield msg
+                except queue.Empty:
+                    # Send keepalive
+                    yield ": keepalive\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            sse_clients.pop(client_id, None)
+
+    return Response(stream(), mimetype="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                        "Connection": "keep-alive",
+                    })
+
+
+# ─── Static file serving for sessions ──────────────────────────────
+
+@app.route("/sessions/<session_id>/<filename>")
+def serve_session_file(session_id, filename):
+    """Serve files from a session directory (videos, images)."""
+    sdir = sm.session_dir(session_id)
+    if not sdir.exists():
+        return "Not found", 404
+    # Only allow safe file types
+    allowed = {".mp4", ".png", ".jpg", ".jpeg", ".webp", ".json"}
+    ext = Path(filename).suffix.lower()
+    if ext not in allowed:
+        return "Forbidden", 403
+    return send_from_directory(str(sdir), filename)
+
+
+@app.route("/input/<filename>")
+def serve_input(filename):
+    return send_from_directory(str(UPLOAD_DIR), filename)
+
+
+# ─── Main ──────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    print("=" * 60)
+    print("  Wan 2.2 I2V — Web UI")
+    print(f"  http://localhost:{args.port}")
+    print("=" * 60)
+
+    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)

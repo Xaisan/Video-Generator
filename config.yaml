@@ -1,0 +1,129 @@
+# ─── Wan 2.2 I2V AMD Video Generator — Config ──────────────────────
+# All paths are relative to the container's /app mount or absolute.
+
+# HuggingFace model ID — used to download text_encoder, vae, image_encoder, scheduler, etc.
+# The transformer weights come from local GGUF files instead (much smaller, fits in VRAM).
+model_id: "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
+
+# ─── GGUF transformer checkpoints (local) ──────────────────────────
+# These are loaded via WanTransformer3DModel.from_single_file() with
+# GGUFQuantizationConfig.  Q6_K ≈ 10 GB each → fits in 24 GB VRAM
+# with group offloading.
+gguf_transformer_high: "models/unet/Wan2.2-I2V-A14B-HighNoise-Q6_K.gguf"
+gguf_transformer_low:  "models/unet/Wan2.2-I2V-A14B-LowNoise-Q6_K.gguf"
+
+# ─── LoRA configuration ────────────────────────────────────────────
+# Each entry: path (local .safetensors), target (transformer|transformer_2),
+# adapter_name, scale.
+# NOTE on GGUF + LoRA: LoRAs CANNOT be fused into GGUF weights (shape mismatch).
+# They run unfused at inference time (small overhead, but works correctly).
+# LoRAs are loaded BEFORE group offloading is applied.
+loras:
+  # --- LightX2V step-distillation LoRA (50→4-8 steps) ---
+  # Same file for BOTH high and low noise transformers
+  - path: "models/loras/Wan21_I2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors"
+    target: "transformer"
+    adapter_name: "lightx2v_high"
+    scale: 3.0
+
+  - path: "models/loras/Wan21_I2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors"
+    target: "transformer_2"
+    adapter_name: "lightx2v_low"
+    scale: 3.0
+
+  # --- wan2.2 t2v speed LoRAs ---
+  - path: "models/loras/wan2.2_t2v_A14b_high_noise_lora_rank64_lightx2v_4step_1217.safetensors"
+    target: "transformer"
+    adapter_name: "t2v_speed_high"
+    scale: 1.0
+
+  - path: "models/loras/wan2.2_t2v_A14b_low_noise_lora_rank64_lightx2v_4step_1217.safetensors"
+    target: "transformer_2"
+    adapter_name: "t2v_speed_low"
+    scale: 1.0
+
+  # --- NS quality LoRAs ---
+  - path: "models/loras/NS-22-H-e8.safetensors"
+    target: "transformer"
+    adapter_name: "ns_high"
+    scale: 0.9
+
+  - path: "models/loras/NS-22-L-e8.safetensors"
+    target: "transformer_2"
+    adapter_name: "ns_low"
+    scale: 0.9
+
+  # --- DR3 quality LoRAs ---
+  - path: "models/loras/DR3_I2V_14B_HIGH_V2.safetensors"
+    target: "transformer"
+    adapter_name: "dr3_high"
+    scale: 0.9
+
+  - path: "models/loras/DR3_I2V_14B_LOW_V2.safetensors"
+    target: "transformer_2"
+    adapter_name: "dr3_low"
+    scale: 0.9
+
+  # --- Sparse/temporal LoRAs ---
+  - path: "models/loras/s_t_HighNoise_merged3_7_v2.safetensors"
+    target: "transformer"
+    adapter_name: "st_high"
+    scale: 0.3
+
+  - path: "models/loras/s_t_LowNoise_merged3_7_v2.safetensors"
+    target: "transformer_2"
+    adapter_name: "st_low"
+    scale: 0.3
+
+# ─── Generation settings ───────────────────────────────────────────
+prompt: "A cat walking gracefully across a sunlit garden path, cinematic lighting, 4K quality"
+negative_prompt: "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
+
+input_image: "input/input.png"
+output_path: "output/video.mp4"
+
+# Video dimensions (must be multiples of 16)
+width: 832
+height: 480
+num_frames: 81         # 4k+1 rule → (81-1)/4 = 20 latent frames
+fps: 16
+
+# ─── Sampler / scheduler ───────────────────────────────────────────
+num_inference_steps: 8      # LightX2V allows 4-8 steps
+guidance_scale: 1.0         # CFG=1 for distilled LoRAs (no classifier-free guidance)
+guidance_scale_2: 1.0       # Low-noise stage CFG
+flow_shift: 8.0             # 8.0 for I2V (5.0 for 720p T2V, 3.0 for 480p T2V)
+seed: 42                    # -1 for random
+
+# ─── Two-stage boundary ────────────────────────────────────────────
+# Wan 2.2 I2V default: 0.9 (90% high-noise → 10% low-noise)
+# With 8 steps: steps 0-6 = high-noise transformer, steps 7 = low-noise transformer_2
+boundary_ratio: 0.9
+
+# ─── Memory management ─────────────────────────────────────────────
+# group_offload: moves transformer blocks CPU↔GPU on-the-fly
+# Drastically cuts peak VRAM (24GB → ~14GB usable for 14B model)
+enable_group_offload: true
+offload_type: "leaf_level"   # "leaf_level" (most granular) or "block_level"
+use_stream: true             # async copy via HIP streams (AMD-optimised)
+
+# ─── VAE settings ──────────────────────────────────────────────────
+# VAE must stay float32 for quality; we tile it to fit in VRAM
+vae_tiling: true
+vae_slicing: true
+
+# ─── Upscale (optional, post-generation) ───────────────────────────
+enable_upscale: false
+upscale_model: "models/upscale_models/4x_NMKD-Siax_200k.pth"
+
+# ─── AMD-specific tuning ───────────────────────────────────────────
+amd:
+  # Force gfx1100 ISA (7900 XTX)
+  hsa_override_gfx_version: "11.0.0"
+  # Expandable VRAM segments — avoids fragmentation OOMs
+  pytorch_hip_alloc_conf: "expandable_segments:True"
+  # Torch compile (experimental on ROCm — disable if it hangs)
+  enable_torch_compile: false
+  compile_mode: "reduce-overhead"   # or "max-autotune"
+  # Use float16 instead of bfloat16 if ROCm bfloat16 is slow
+  force_fp16: false
