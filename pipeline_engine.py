@@ -388,7 +388,7 @@ class SessionLogger:
             f.write(f"  Resolution:       {info.width}×{info.height} ({info.width*info.height/1e6:.2f} MP)\n")
             f.write(f"  Frames:           {info.num_frames} ({info.duration}s @ {info.fps}fps)\n")
             f.write(f"  Output FPS:       {info.output_fps}\n")
-            f.write(f"  Steps / pass:     {info.num_inference_steps} (total: {info.num_inference_steps * 2})\n")
+            f.write(f"  Steps (total):    {info.num_inference_steps}\n")
             f.write(f"  CFG High:         {info.guidance_scale}\n")
             f.write(f"  CFG Low:          {info.guidance_scale_2}\n")
             f.write(f"  Flow shift:       {info.flow_shift}\n")
@@ -699,14 +699,18 @@ class PipelineEngine:
     def step_denoise(self, session_id: str) -> bool:
         """Run two-pass transformer denoising → latents checkpoint.
 
-        Memory-optimised architecture:
-        ──────────────────────────────
-        Phase 1: VAE encode only (~0.5 GB VRAM).
-                 Produces latents + condition tensors.  VAE freed.
-        Phase 2: High-noise transformer only (~10 GB RAM + offloaded VRAM).
-                 LoRAs loaded per-pass.  Pass 1 denoising.  Freed.
-        Phase 3: Low-noise transformer only (~10 GB RAM + offloaded VRAM).
-                 LoRAs loaded per-pass.  Pass 2 denoising.  Freed.
+        Architecture (matches reference WanImageToVideoPipeline):
+        ──────────────────────────────────────────────────────────
+        Uses a SINGLE scheduler with ONE set_timesteps() call to maintain
+        UniPC multi-step solver state.  boundary_timestep splits timesteps
+        between the two transformers:
+          - timesteps >= boundary → high-noise transformer
+          - timesteps < boundary  → low-noise transformer
+
+        Sequential loading: only one transformer in memory at a time.
+        Phase 1: VAE encode → latents + condition. VAE freed.
+        Phase 2: High-noise transformer loaded, LoRAs, offload, run steps >= boundary. Freed.
+        Phase 3: Low-noise transformer loaded, LoRAs, offload, run steps < boundary. Freed.
 
         Peak RAM: ~10 GB (one transformer at a time).
         Peak VRAM: ~14 GB (transformer blocks offloaded, latents + embeds on GPU).
@@ -913,272 +917,308 @@ class PipelineEngine:
                     self._slog.vram_event("denoise", "CLIP encoder freed")
 
             # ══════════════════════════════════════════════════════════
-            #  SIGMA SCHEDULE
+            #  TIMESTEP SCHEDULE  (single scheduler, reference-correct)
             # ══════════════════════════════════════════════════════════
-            steps_per_pass = info.num_inference_steps
-            total_steps = steps_per_pass * 2
+            num_inference_steps = info.num_inference_steps
 
             # boundary_ratio controls where the high→low split happens
-            boundary_ratio = cfg.get("boundary_ratio", 0.5)
-            # Also check session-level override
+            # boundary_timestep = boundary_ratio × num_train_timesteps
+            # (this is how the reference WanImageToVideoPipeline does it)
+            boundary_ratio = cfg.get("boundary_ratio", 0.618)
             if hasattr(info, "boundary_ratio") and info.boundary_ratio is not None:
                 boundary_ratio = info.boundary_ratio
             boundary_ratio = max(0.1, min(0.9, float(boundary_ratio)))
 
-            full_sched = UniPCMultistepScheduler.from_config(
+            # Single scheduler for the entire loop — preserves UniPC solver state
+            main_sched = UniPCMultistepScheduler.from_config(
                 sched.config, flow_shift=flow_shift,
             )
-            full_sched.set_timesteps(total_steps)
-            full_sigmas = full_sched.sigmas.numpy().copy()
+            main_sched.set_timesteps(num_inference_steps, device="cpu")
+            timesteps = main_sched.timesteps
+            all_sigmas = main_sched.sigmas
 
-            # Split point: round to nearest step boundary
-            split_step = max(1, min(total_steps - 1, round(total_steps * boundary_ratio)))
-            pass1_input = full_sigmas[0:split_step]
-            pass2_input = full_sigmas[split_step:total_steps]
-            boundary_sigma = float(full_sigmas[split_step])
+            # Compute boundary in timestep space (same as reference pipeline)
+            boundary_timestep = boundary_ratio * main_sched.config.num_train_timesteps
 
-            print(f"  Schedule: {split_step}+{total_steps - split_step}={total_steps} steps, "
-                  f"boundary_ratio={boundary_ratio:.2f}, boundary={boundary_sigma:.6f}")
-            print(f"  Sigmas: {[f'{s:.4f}' for s in full_sigmas]}")
+            # Partition timesteps: high-noise (>= boundary) and low-noise (< boundary)
+            high_indices = []
+            low_indices = []
+            for i, t in enumerate(timesteps):
+                if float(t) >= boundary_timestep:
+                    high_indices.append(i)
+                else:
+                    low_indices.append(i)
+
+            print(f"  Schedule: {num_inference_steps} steps, flow_shift={flow_shift}, "
+                  f"boundary_ratio={boundary_ratio:.3f}, "
+                  f"boundary_timestep={boundary_timestep:.0f}")
+            print(f"  High-noise steps: {len(high_indices)}, Low-noise steps: {len(low_indices)}")
+            print(f"  Timesteps: {timesteps.tolist()}")
+            print(f"  Sigmas: {[f'{s:.4f}' for s in all_sigmas.tolist()]}")
             if self._slog:
-                self._slog.log_sigmas("denoise", full_sigmas, split_step,
-                                      boundary_sigma, boundary_ratio)
+                self._slog.log("denoise", f"Timestep schedule: {num_inference_steps} steps, "
+                               f"flow_shift={flow_shift}")
+                self._slog.log("denoise", f"boundary_ratio={boundary_ratio:.3f}, "
+                               f"boundary_timestep={boundary_timestep:.0f}")
+                self._slog.log("denoise", f"High-noise steps: {len(high_indices)} "
+                               f"({[int(timesteps[i]) for i in high_indices]})")
+                self._slog.log("denoise", f"Low-noise steps: {len(low_indices)} "
+                               f"({[int(timesteps[i]) for i in low_indices]})")
+                self._slog.log("denoise", f"Full sigmas: "
+                               f"{[f'{s:.4f}' for s in all_sigmas.tolist()]}")
 
             guidance_scale = info.guidance_scale
-            guidance_scale_2 = info.guidance_scale_2
+            guidance_scale_2 = getattr(info, "guidance_scale_2", None)
+            if guidance_scale_2 is None:
+                guidance_scale_2 = guidance_scale
             do_cfg = guidance_scale > 1.0
 
             self._emit(session_id, "denoise", 20,
-                       f"Two-pass denoise: {total_steps} total steps")
+                       f"Denoise: {num_inference_steps} steps "
+                       f"({len(high_indices)} high + {len(low_indices)} low)")
             print(f"  VRAM before denoise loops: {vram_stats()}")
-            print(f"  CFG: gs1={guidance_scale}, gs2={guidance_scale_2}")
+            print(f"  CFG: gs_high={guidance_scale}, gs_low={guidance_scale_2}, do_cfg={do_cfg}")
 
             # ══════════════════════════════════════════════════════════
             #  PASS 1: High-noise transformer (load → LoRA → offload → run → free)
+            #  Runs timesteps >= boundary_timestep
             # ══════════════════════════════════════════════════════════
-            self._emit(session_id, "denoise", 22,
-                       "Pass 1: Loading high-noise transformer…")
-            print(f"  RAM before high-noise load: {ram_stats()}")
+            if high_indices:
+                self._emit(session_id, "denoise", 22,
+                           "Pass 1: Loading high-noise transformer…")
+                print(f"  RAM before high-noise load: {ram_stats()}")
 
-            transformer_high = load_single_transformer(cfg, "high")
-            print(f"  RAM after high-noise load: {ram_stats()}")
-            if self._slog:
-                self._slog.log("denoise", "High-noise transformer loaded")
-                self._slog.vram_event("denoise", "high-noise transformer loaded")
-
-            # Temporary pipe for LoRA loading API
-            pipe_pass1 = WanImageToVideoPipeline(
-                tokenizer=tokenizer,
-                text_encoder=None,
-                transformer=transformer_high,
-                vae=None,
-                scheduler=sched,
-                image_processor=None,
-            )
-
-            # LoRAs for high-noise ONLY
-            self._emit(session_id, "denoise", 24, "Loading high-noise LoRAs…")
-            apply_loras_to_transformer(pipe_pass1, cfg, "transformer",
-                                       info.lora_scales)
-            print(f"  VRAM after high-noise LoRAs: {vram_stats()}")
-            if self._slog:
-                self._slog.vram_event("denoise", "high-noise LoRAs applied")
-
-            # Group offloading
-            if use_offload:
-                num_blocks = cfg.get("num_blocks_per_group", 1)
-                print(f"  Setting up {offload_type} offloading for high-noise (num_blocks_per_group={num_blocks})…")
-                offload_kwargs = dict(
-                    offload_type=offload_type,
-                    offload_device=torch.device("cpu"),
-                    onload_device=torch.device("cuda"),
-                    use_stream=False,
-                )
-                if offload_type == "block_level":
-                    offload_kwargs["num_blocks_per_group"] = num_blocks
-                apply_group_offloading(pipe_pass1.transformer, **offload_kwargs)
-                print(f"  VRAM after offload setup: {vram_stats()}")
+                transformer_high = load_single_transformer(cfg, "high")
+                print(f"  RAM after high-noise load: {ram_stats()}")
                 if self._slog:
-                    self._slog.log("denoise", f"High-noise offloading: {offload_type}, num_blocks={num_blocks}")
-                    self._slog.vram_event("denoise", "high-noise offload setup")
+                    self._slog.log("denoise", "High-noise transformer loaded")
+                    self._slog.vram_event("denoise", "high-noise transformer loaded")
 
-            # Scheduler
-            sched_high = UniPCMultistepScheduler.from_config(
-                sched.config, flow_shift=1.0,
-            )
-            sched_high.set_timesteps(sigmas=pass1_input, device="cpu")
-            sched_high.sigmas[-1] = boundary_sigma
-            timesteps_high = sched_high.timesteps
-            print(f"  Pass 1 timesteps: {timesteps_high.tolist()}")
+                # Temporary pipe for LoRA loading API
+                pipe_pass1 = WanImageToVideoPipeline(
+                    tokenizer=tokenizer,
+                    text_encoder=None,
+                    transformer=transformer_high,
+                    vae=None,
+                    scheduler=sched,
+                    image_processor=None,
+                )
 
-            # ── Denoise loop (Pass 1) ──
-            current_model = pipe_pass1.transformer
-            for i, t in enumerate(timesteps_high):
-                if self._cancel_flag:
-                    raise InterruptedError("Generation cancelled by user")
+                # LoRAs for high-noise ONLY
+                self._emit(session_id, "denoise", 24, "Loading high-noise LoRAs…")
+                apply_loras_to_transformer(pipe_pass1, cfg, "transformer",
+                                           info.lora_scales)
+                print(f"  VRAM after high-noise LoRAs: {vram_stats()}")
+                if self._slog:
+                    self._slog.vram_event("denoise", "high-noise LoRAs applied")
 
-                pct = 25 + int(25 * (i + 1) / steps_per_pass)
-                gpu_gb = vram_stats().get("allocated_gb", 0)
-                self._emit(session_id, "denoise", pct,
-                           f"Pass 1 step {i+1}/{steps_per_pass} "
-                           f"(t={t:.0f}, GPU: {gpu_gb:.1f} GB)")
+                # Group offloading
+                if use_offload:
+                    num_blocks = cfg.get("num_blocks_per_group", 1)
+                    print(f"  Setting up {offload_type} offloading for high-noise "
+                          f"(num_blocks_per_group={num_blocks})…")
+                    offload_kwargs = dict(
+                        offload_type=offload_type,
+                        offload_device=torch.device("cpu"),
+                        onload_device=torch.device("cuda"),
+                        use_stream=False,
+                    )
+                    if offload_type == "block_level":
+                        offload_kwargs["num_blocks_per_group"] = num_blocks
+                    apply_group_offloading(pipe_pass1.transformer, **offload_kwargs)
+                    print(f"  VRAM after offload setup: {vram_stats()}")
+                    if self._slog:
+                        self._slog.log("denoise", f"High-noise offloading: "
+                                       f"{offload_type}, num_blocks={num_blocks}")
+                        self._slog.vram_event("denoise", "high-noise offload setup")
 
-                latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
-                timestep = t.expand(latents.shape[0])
+                current_model = pipe_pass1.transformer
+                print(f"  Pass 1: running {len(high_indices)} high-noise steps "
+                      f"(timesteps: {[int(timesteps[i]) for i in high_indices]})")
 
-                with torch.no_grad():
-                    with current_model.cache_context("cond"):
-                        noise_pred = current_model(
-                            hidden_states=latent_model_input,
-                            timestep=timestep,
-                            encoder_hidden_states=prompt_embeds,
-                            encoder_hidden_states_image=image_embeds,
-                            return_dict=False,
-                        )[0]
+                # ── Denoise loop (Pass 1: high-noise) ──
+                for step_idx in high_indices:
+                    if self._cancel_flag:
+                        raise InterruptedError("Generation cancelled by user")
 
-                    if do_cfg:
-                        with current_model.cache_context("uncond"):
-                            noise_uncond = current_model(
+                    t = timesteps[step_idx]
+                    i_global = step_idx  # absolute position in schedule
+                    pct = 25 + int(50 * (i_global + 1) / num_inference_steps)
+                    gpu_gb = vram_stats().get("allocated_gb", 0)
+                    self._emit(session_id, "denoise", pct,
+                               f"Pass 1 step {step_idx+1}/{num_inference_steps} "
+                               f"(t={t:.0f}, GPU: {gpu_gb:.1f} GB)")
+
+                    latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
+                    timestep = t.expand(latents.shape[0])
+
+                    with torch.no_grad():
+                        with current_model.cache_context("cond"):
+                            noise_pred = current_model(
                                 hidden_states=latent_model_input,
                                 timestep=timestep,
-                                encoder_hidden_states=negative_prompt_embeds,
+                                encoder_hidden_states=prompt_embeds,
                                 encoder_hidden_states_image=image_embeds,
                                 return_dict=False,
                             )[0]
-                        noise_pred = noise_uncond + guidance_scale * (
-                            noise_pred - noise_uncond)
 
-                latents = sched_high.step(noise_pred, t, latents,
-                                          return_dict=False)[0]
+                        if do_cfg:
+                            with current_model.cache_context("uncond"):
+                                noise_uncond = current_model(
+                                    hidden_states=latent_model_input,
+                                    timestep=timestep,
+                                    encoder_hidden_states=negative_prompt_embeds,
+                                    encoder_hidden_states_image=image_embeds,
+                                    return_dict=False,
+                                )[0]
+                            noise_pred = noise_uncond + guidance_scale * (
+                                noise_pred - noise_uncond)
+
+                    latents = main_sched.step(noise_pred, t, latents,
+                                              return_dict=False)[0]
+                    if self._slog:
+                        self._slog.log_denoise_step("denoise", 1, step_idx,
+                                                    num_inference_steps, float(t))
+                        self._slog.vram_denoise_sample("denoise", 1, step_idx,
+                                                       num_inference_steps, float(t))
+
+                print(f"  Pass 1 complete. VRAM: {vram_stats()}")
                 if self._slog:
-                    self._slog.log_denoise_step("denoise", 1, i, len(timesteps_high), float(t))
-                    self._slog.vram_denoise_sample("denoise", 1, i, len(timesteps_high), float(t))
+                    self._slog.log("denoise", f"Pass 1 complete ({len(high_indices)} steps)")
+                    self._slog.vram_event("denoise", "pass 1 complete")
 
-            print(f"  Pass 1 complete. VRAM: {vram_stats()}")
-            if self._slog:
-                self._slog.log("denoise", f"Pass 1 complete ({len(timesteps_high)} steps)")
-                self._slog.vram_event("denoise", "pass 1 complete")
-
-            # ── Free high-noise transformer completely ──
-            remove_offloading(pipe_pass1.transformer)
-            pipe_pass1.transformer.to("meta")
-            pipe_pass1.transformer = None
-            del pipe_pass1, current_model, transformer_high
-            gc.collect()
-            flush_vram()
-            print(f"  Freed high-noise. VRAM: {vram_stats()}  RAM: {ram_stats()}")
-            if self._slog:
-                self._slog.vram_event("denoise", "high-noise transformer freed")
+                # ── Free high-noise transformer completely ──
+                remove_offloading(pipe_pass1.transformer)
+                pipe_pass1.transformer.to("meta")
+                pipe_pass1.transformer = None
+                del pipe_pass1, current_model, transformer_high
+                gc.collect()
+                flush_vram()
+                print(f"  Freed high-noise. VRAM: {vram_stats()}  RAM: {ram_stats()}")
+                if self._slog:
+                    self._slog.vram_event("denoise", "high-noise transformer freed")
 
             # ══════════════════════════════════════════════════════════
             #  PASS 2: Low-noise transformer (load → LoRA → offload → run → free)
+            #  Runs timesteps < boundary_timestep
+            #  The scheduler object (main_sched) carries over state from Pass 1
             # ══════════════════════════════════════════════════════════
-            self._emit(session_id, "denoise", 52,
-                       "Pass 2: Loading low-noise transformer…")
-            print(f"  RAM before low-noise load: {ram_stats()}")
+            if low_indices:
+                self._emit(session_id, "denoise", 52,
+                           "Pass 2: Loading low-noise transformer…")
+                print(f"  RAM before low-noise load: {ram_stats()}")
 
-            transformer_low = load_single_transformer(cfg, "low")
-            print(f"  RAM after low-noise load: {ram_stats()}")
-            if self._slog:
-                self._slog.log("denoise", "Low-noise transformer loaded")
-                self._slog.vram_event("denoise", "low-noise transformer loaded")
-
-            pipe_pass2 = WanImageToVideoPipeline(
-                tokenizer=tokenizer,
-                text_encoder=None,
-                transformer=transformer_low,
-                vae=None,
-                scheduler=sched,
-                image_processor=None,
-            )
-
-            # LoRAs for low-noise ONLY
-            # We load into pipe.transformer (not transformer_2) because
-            # load_lora_weights needs a non-None .transformer to read config.
-            # target="transformer_2" is only used to filter the config entries.
-            self._emit(session_id, "denoise", 54, "Loading low-noise LoRAs…")
-            apply_loras_to_transformer(pipe_pass2, cfg, "transformer_2",
-                                       info.lora_scales,
-                                       load_as_primary=True)
-            print(f"  VRAM after low-noise LoRAs: {vram_stats()}")
-            if self._slog:
-                self._slog.vram_event("denoise", "low-noise LoRAs applied")
-
-            # Group offloading
-            if use_offload:
-                num_blocks = cfg.get("num_blocks_per_group", 1)
-                print(f"  Setting up {offload_type} offloading for low-noise (num_blocks_per_group={num_blocks})…")
-                offload_kwargs = dict(
-                    offload_type=offload_type,
-                    offload_device=torch.device("cpu"),
-                    onload_device=torch.device("cuda"),
-                    use_stream=False,
-                )
-                if offload_type == "block_level":
-                    offload_kwargs["num_blocks_per_group"] = num_blocks
-                apply_group_offloading(pipe_pass2.transformer, **offload_kwargs)
-                print(f"  VRAM after offload setup: {vram_stats()}")
+                transformer_low = load_single_transformer(cfg, "low")
+                print(f"  RAM after low-noise load: {ram_stats()}")
                 if self._slog:
-                    self._slog.log("denoise", f"Low-noise offloading: {offload_type}, num_blocks={num_blocks}")
-                    self._slog.vram_event("denoise", "low-noise offload setup")
+                    self._slog.log("denoise", "Low-noise transformer loaded")
+                    self._slog.vram_event("denoise", "low-noise transformer loaded")
 
-            # Scheduler
-            sched_low = UniPCMultistepScheduler.from_config(
-                sched.config, flow_shift=1.0,
-            )
-            sched_low.set_timesteps(sigmas=pass2_input, device="cpu")
-            timesteps_low = sched_low.timesteps
-            print(f"  Pass 2 timesteps: {timesteps_low.tolist()}")
+                pipe_pass2 = WanImageToVideoPipeline(
+                    tokenizer=tokenizer,
+                    text_encoder=None,
+                    transformer=transformer_low,
+                    vae=None,
+                    scheduler=sched,
+                    image_processor=None,
+                )
 
-            do_cfg_2 = guidance_scale_2 > 1.0
-            current_model = pipe_pass2.transformer
+                # LoRAs for low-noise ONLY
+                self._emit(session_id, "denoise", 54, "Loading low-noise LoRAs…")
+                apply_loras_to_transformer(pipe_pass2, cfg, "transformer_2",
+                                           info.lora_scales,
+                                           load_as_primary=True)
+                print(f"  VRAM after low-noise LoRAs: {vram_stats()}")
+                if self._slog:
+                    self._slog.vram_event("denoise", "low-noise LoRAs applied")
 
-            # ── Denoise loop (Pass 2) ──
-            for i, t in enumerate(timesteps_low):
-                if self._cancel_flag:
-                    raise InterruptedError("Generation cancelled by user")
+                # Group offloading
+                if use_offload:
+                    num_blocks = cfg.get("num_blocks_per_group", 1)
+                    print(f"  Setting up {offload_type} offloading for low-noise "
+                          f"(num_blocks_per_group={num_blocks})…")
+                    offload_kwargs = dict(
+                        offload_type=offload_type,
+                        offload_device=torch.device("cpu"),
+                        onload_device=torch.device("cuda"),
+                        use_stream=False,
+                    )
+                    if offload_type == "block_level":
+                        offload_kwargs["num_blocks_per_group"] = num_blocks
+                    apply_group_offloading(pipe_pass2.transformer, **offload_kwargs)
+                    print(f"  VRAM after offload setup: {vram_stats()}")
+                    if self._slog:
+                        self._slog.log("denoise", f"Low-noise offloading: "
+                                       f"{offload_type}, num_blocks={num_blocks}")
+                        self._slog.vram_event("denoise", "low-noise offload setup")
 
-                pct = 52 + int(43 * (i + 1) / steps_per_pass)
-                gpu_gb = vram_stats().get("allocated_gb", 0)
-                self._emit(session_id, "denoise", pct,
-                           f"Pass 2 step {i+1}/{steps_per_pass} "
-                           f"(t={t:.0f}, GPU: {gpu_gb:.1f} GB)")
+                do_cfg_2 = guidance_scale_2 > 1.0
+                current_model = pipe_pass2.transformer
+                print(f"  Pass 2: running {len(low_indices)} low-noise steps "
+                      f"(timesteps: {[int(timesteps[i]) for i in low_indices]})")
 
-                latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
-                timestep = t.expand(latents.shape[0])
+                # ── Denoise loop (Pass 2: low-noise) ──
+                for step_idx in low_indices:
+                    if self._cancel_flag:
+                        raise InterruptedError("Generation cancelled by user")
 
-                with torch.no_grad():
-                    with current_model.cache_context("cond"):
-                        noise_pred = current_model(
-                            hidden_states=latent_model_input,
-                            timestep=timestep,
-                            encoder_hidden_states=prompt_embeds,
-                            encoder_hidden_states_image=image_embeds,
-                            return_dict=False,
-                        )[0]
+                    t = timesteps[step_idx]
+                    pct = 25 + int(50 * (step_idx + 1) / num_inference_steps)
+                    gpu_gb = vram_stats().get("allocated_gb", 0)
+                    self._emit(session_id, "denoise", pct,
+                               f"Pass 2 step {step_idx+1}/{num_inference_steps} "
+                               f"(t={t:.0f}, GPU: {gpu_gb:.1f} GB)")
 
-                    if do_cfg_2:
-                        with current_model.cache_context("uncond"):
-                            noise_uncond = current_model(
+                    latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
+                    timestep = t.expand(latents.shape[0])
+
+                    with torch.no_grad():
+                        with current_model.cache_context("cond"):
+                            noise_pred = current_model(
                                 hidden_states=latent_model_input,
                                 timestep=timestep,
-                                encoder_hidden_states=negative_prompt_embeds,
+                                encoder_hidden_states=prompt_embeds,
                                 encoder_hidden_states_image=image_embeds,
                                 return_dict=False,
                             )[0]
-                        noise_pred = noise_uncond + guidance_scale_2 * (
-                            noise_pred - noise_uncond)
 
-                latents = sched_low.step(noise_pred, t, latents,
-                                         return_dict=False)[0]
+                        if do_cfg_2:
+                            with current_model.cache_context("uncond"):
+                                noise_uncond = current_model(
+                                    hidden_states=latent_model_input,
+                                    timestep=timestep,
+                                    encoder_hidden_states=negative_prompt_embeds,
+                                    encoder_hidden_states_image=image_embeds,
+                                    return_dict=False,
+                                )[0]
+                            noise_pred = noise_uncond + guidance_scale_2 * (
+                                noise_pred - noise_uncond)
+
+                    # Use the SAME scheduler to preserve solver state
+                    latents = main_sched.step(noise_pred, t, latents,
+                                             return_dict=False)[0]
+                    if self._slog:
+                        self._slog.log_denoise_step("denoise", 2, step_idx,
+                                                    num_inference_steps, float(t))
+                        self._slog.vram_denoise_sample("denoise", 2, step_idx,
+                                                       num_inference_steps, float(t))
+
+                print(f"  Pass 2 complete. VRAM: {vram_stats()}")
                 if self._slog:
-                    self._slog.log_denoise_step("denoise", 2, i, len(timesteps_low), float(t))
-                    self._slog.vram_denoise_sample("denoise", 2, i, len(timesteps_low), float(t))
+                    self._slog.log("denoise", f"Pass 2 complete ({len(low_indices)} steps)")
+                    self._slog.vram_event("denoise", "pass 2 complete")
 
-            print(f"  Pass 2 complete. VRAM: {vram_stats()}")
-            if self._slog:
-                self._slog.log("denoise", f"Pass 2 complete ({len(timesteps_low)} steps)")
-                self._slog.vram_event("denoise", "pass 2 complete")
+                # Free low-noise transformer
+                remove_offloading(pipe_pass2.transformer)
+                pipe_pass2.transformer.to("meta")
+                pipe_pass2.transformer = None
+                del pipe_pass2, current_model, transformer_low
+                gc.collect()
+                flush_vram()
+            else:
+                print(f"  No low-noise steps (all timesteps >= boundary)")
+                if self._slog:
+                    self._slog.log("denoise", "No low-noise steps needed")
 
             # ── Save result ──
             self.sm.save_checkpoint(session_id, "latents", latents.cpu())
@@ -1187,10 +1227,6 @@ class PipelineEngine:
                     self.sm.session_dir(session_id) / "latents.pt")
 
             # Free everything
-            remove_offloading(pipe_pass2.transformer)
-            pipe_pass2.transformer.to("meta")
-            pipe_pass2.transformer = None
-            del pipe_pass2, current_model, transformer_low
             del latents, condition, prompt_embeds, negative_prompt_embeds
             if image_embeds is not None:
                 del image_embeds
@@ -1203,7 +1239,9 @@ class PipelineEngine:
                 self._slog.vram_event("denoise", "all freed")
                 self._slog.step_end("denoise", "done", elapsed)
             self._emit(session_id, "denoise", 100,
-                       f"Denoising done in {elapsed:.1f}s ({total_steps} steps)")
+                       f"Denoising done in {elapsed:.1f}s "
+                       f"({len(high_indices)} high + {len(low_indices)} low "
+                       f"= {num_inference_steps} steps)")
             print(f"  === DENOISE DONE === VRAM: {vram_stats()}  RAM: {ram_stats()}",
                   flush=True)
             return True

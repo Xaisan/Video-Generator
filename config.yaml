@@ -91,19 +91,20 @@ duration: 5.0          # Video length in seconds (frames auto-calculated from du
 output_fps: 24         # Output framerate after RIFE interpolation (0 = same as fps)
 
 # ─── Sampler / scheduler ───────────────────────────────────────────
-num_inference_steps: 8      # Steps PER PASS (total = 2× this: 8 high + 8 low = 16)
-guidance_scale: 2.0         # CFG for high-noise pass (matches ComfyUI KSampler cfg)
-guidance_scale_2: 2.0       # CFG for low-noise pass
+num_inference_steps: 16     # TOTAL steps (split between high & low via boundary_ratio)
+guidance_scale: 5.0         # CFG for high-noise pass (>1.0 enables CFG, 5.0 is reference default)
+guidance_scale_2: 5.0       # CFG for low-noise pass (if None → same as guidance_scale)
 flow_shift: 8.0             # 8.0 for I2V (5.0 for 720p T2V, 3.0 for 480p T2V)
 seed: 42                    # -1 for random
 
 # ─── Two-stage boundary ────────────────────────────────────────────
-# ComfyUI flow: TWO KSampler nodes, each 8 steps, chained:
-#   Node 1 (high-noise): 8 steps, sigmas from 1.0 → boundary
-#   Node 2 (low-noise):  8 steps, sigmas from boundary → 0.0
-# boundary_ratio = 0.5 means the split is at 50% of the sigma range
-# With 8 steps per pass, total = 16 denoising steps
-boundary_ratio: 0.5
+# Reference WanImageToVideoPipeline approach:
+#   boundary_timestep = boundary_ratio × num_train_timesteps (1000)
+#   timesteps >= boundary → high-noise transformer
+#   timesteps < boundary  → low-noise transformer
+# With flow_shift=8.0 and 16 steps, ratio=0.618 gives ~14 high + 2 low steps
+# Higher ratio → more steps go to high-noise, fewer to low-noise
+boundary_ratio: 0.618
 
 # ─── Memory management ─────────────────────────────────────────────
 # group_offload: moves transformer blocks CPU↔GPU on-the-fly

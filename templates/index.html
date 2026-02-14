@@ -123,25 +123,25 @@
             <!-- Sampler row -->
             <div class="param-row">
               <div class="param-item">
-                <label for="steps">Steps / pass</label>
+                <label for="steps">Steps (total)</label>
                 <div class="hybrid-input">
-                  <input type="range" id="steps" value="{{ config.get('num_inference_steps', 8) }}" min="1" max="50" step="1" />
-                  <input type="number" id="steps-num" value="{{ config.get('num_inference_steps', 8) }}" min="1" max="50" step="1" class="param-number" />
+                  <input type="range" id="steps" value="{{ config.get('num_inference_steps', 16) }}" min="1" max="50" step="1" />
+                  <input type="number" id="steps-num" value="{{ config.get('num_inference_steps', 16) }}" min="1" max="50" step="1" class="param-number" />
                 </div>
-                <div class="computed-hint">Total: <span id="total-steps">16</span> (2 passes)</div>
+                <div class="computed-hint">Split across high↔low by boundary ratio</div>
               </div>
               <div class="param-item">
                 <label for="cfg">CFG High</label>
                 <div class="hybrid-input">
-                  <input type="range" id="cfg" value="{{ config.get('guidance_scale', 2.0) }}" min="1" max="20" step="0.05" />
-                  <input type="number" id="cfg-num" value="{{ config.get('guidance_scale', 2.0) }}" min="1" max="20" step="0.05" class="param-number" />
+                  <input type="range" id="cfg" value="{{ config.get('guidance_scale', 5.0) }}" min="1" max="20" step="0.05" />
+                  <input type="number" id="cfg-num" value="{{ config.get('guidance_scale', 5.0) }}" min="1" max="20" step="0.05" class="param-number" />
                 </div>
               </div>
               <div class="param-item">
                 <label for="cfg2">CFG Low</label>
                 <div class="hybrid-input">
-                  <input type="range" id="cfg2" value="{{ config.get('guidance_scale_2', 2.0) }}" min="1" max="20" step="0.05" />
-                  <input type="number" id="cfg2-num" value="{{ config.get('guidance_scale_2', 2.0) }}" min="1" max="20" step="0.05" class="param-number" />
+                  <input type="range" id="cfg2" value="{{ config.get('guidance_scale_2', 5.0) }}" min="1" max="20" step="0.05" />
+                  <input type="number" id="cfg2-num" value="{{ config.get('guidance_scale_2', 5.0) }}" min="1" max="20" step="0.05" class="param-number" />
                 </div>
               </div>
             </div>
@@ -159,8 +159,8 @@
               <div class="param-item">
                 <label for="boundary-ratio">Boundary Ratio</label>
                 <div class="hybrid-input">
-                  <input type="range" id="boundary-ratio" value="{{ config.get('boundary_ratio', 0.5) }}" min="0.1" max="0.9" step="0.01" />
-                  <input type="number" id="boundary-ratio-num" value="{{ config.get('boundary_ratio', 0.5) }}" min="0.1" max="0.9" step="0.01" class="param-number" />
+                  <input type="range" id="boundary-ratio" value="{{ config.get('boundary_ratio', 0.618) }}" min="0.1" max="0.9" step="0.01" />
+                  <input type="number" id="boundary-ratio-num" value="{{ config.get('boundary_ratio', 0.618) }}" min="0.1" max="0.9" step="0.01" class="param-number" />
                 </div>
                 <div class="computed-hint">High↔Low noise split point</div>
               </div>

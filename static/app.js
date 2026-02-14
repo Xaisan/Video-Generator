@@ -155,9 +155,8 @@
   }
 
   function updateTotalSteps() {
-    const steps = parseInt($("#steps").value) || 8;
-    const el = $("#total-steps");
-    if (el) el.textContent = steps * 2;
+    // Steps value is now total steps (split between high & low by boundary ratio)
+    // No calculation needed — the UI value IS the total
   }
 
   // ─── Toast notification system ──────────────────────────────
@@ -703,12 +702,12 @@
       setParam("height", d.height || 480);
       setParam("duration", d.duration || 5.0);
       setParam("fps", d.fps || 16);
-      setParam("steps", d.num_inference_steps || 8);
-      setParam("cfg", d.guidance_scale || 2.0);
-      setParam("cfg2", d.guidance_scale_2 || 2.0);
+      setParam("steps", d.num_inference_steps || 16);
+      setParam("cfg", d.guidance_scale || 5.0);
+      setParam("cfg2", d.guidance_scale_2 || 5.0);
       setParam("flow-shift", d.flow_shift || 8.0);
       setParam("output-fps", d.output_fps || 24);
-      setParam("boundary-ratio", d.boundary_ratio || 0.5);
+      setParam("boundary-ratio", d.boundary_ratio || 0.618);
       $("#seed").value = d.seed || 42;
       $("#enable-upscale").checked = d.enable_upscale || false;
 

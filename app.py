@@ -218,9 +218,9 @@ def api_generate():
             "width": int(data.get("width", config.get("width", 832))),
             "height": int(data.get("height", config.get("height", 480))),
             "num_frames": int(data.get("num_frames", config.get("num_frames", 81))),
-            "num_inference_steps": int(data.get("num_inference_steps", config.get("num_inference_steps", 8))),
-            "guidance_scale": float(data.get("guidance_scale", config.get("guidance_scale", 2.0))),
-            "guidance_scale_2": float(data.get("guidance_scale_2", config.get("guidance_scale_2", 2.0))),
+            "num_inference_steps": int(data.get("num_inference_steps", config.get("num_inference_steps", 16))),
+            "guidance_scale": float(data.get("guidance_scale", config.get("guidance_scale", 5.0))),
+            "guidance_scale_2": float(data.get("guidance_scale_2", config.get("guidance_scale_2", 5.0))),
             "flow_shift": float(data.get("flow_shift", config.get("flow_shift", 8.0))),
             "seed": int(data.get("seed", config.get("seed", 42))),
             "fps": int(data.get("fps", config.get("fps", 16))),
@@ -228,7 +228,7 @@ def api_generate():
             "output_fps": int(data.get("output_fps", config.get("output_fps", 24))),
             "enable_upscale": data.get("enable_upscale", False),
             "lora_scales": data.get("lora_scales", []),
-            "boundary_ratio": float(data.get("boundary_ratio", config.get("boundary_ratio", 0.5))),
+            "boundary_ratio": float(data.get("boundary_ratio", config.get("boundary_ratio", 0.618))),
         }
 
         # Memory / performance overrides — apply to engine cfg
