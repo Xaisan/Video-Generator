@@ -1824,11 +1824,21 @@ class PipelineEngine:
             upscale_cfg = dict(self.cfg)
             upscale_cfg["fps"] = info.fps
             upscale_cfg["output_fps"] = getattr(info, "output_fps", info.fps)
+            # Use session-specific upscale model if set
+            if hasattr(info, "upscale_model") and info.upscale_model:
+                upscale_cfg["upscale_model"] = info.upscale_model
             if self._slog:
                 self._slog.log("upscale", f"Input: {video_path}, Output: {up_path}")
                 self._slog.log("upscale", f"fps={info.fps}, output_fps={upscale_cfg['output_fps']}")
+                self._slog.log("upscale", f"model={upscale_cfg.get('upscale_model', 'default')}")
 
-            upscale_video(str(video_path), up_path, upscale_cfg)
+            def upscale_progress(pct, msg):
+                self._emit(session_id, "upscale", pct, msg)
+                if self._slog:
+                    self._slog.log("upscale", msg)
+
+            upscale_video(str(video_path), up_path, upscale_cfg,
+                          progress_fn=upscale_progress)
 
             info_up = self.sm.get_session(session_id)
             if info_up and "output_upscaled.mp4" not in info_up.checkpoints:

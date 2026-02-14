@@ -194,8 +194,12 @@ force_vae_cpu: false
 
 # ─── Upscale (optional, post-generation) ───────────────────────────
 enable_upscale: false
-upscale_model: "models/upscale_models/4x_NMKD-Siax_200k.pth"
+upscale_model: "models/upscale_models/4xRealWebPhoto_v4_dat2.pth"
 rife_model: "models/upscale_models/rife47.pth"
+# Available upscale models (shown in UI dropdown):
+#   4xRealWebPhoto_v4_dat2.pth  — DAT-2 architecture, 134MB, best quality for real/photo content
+#   RealESRGAN_x4plus.pth       — RRDB/ESRGAN, 64MB, classic reliable upscaler
+#   4x_NMKD-Siax_200k.pth      — ESRGAN, 64MB, weak (legacy, not recommended)
 
 # ─── AMD-specific tuning ───────────────────────────────────────────
 amd:

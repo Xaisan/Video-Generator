@@ -64,6 +64,7 @@ class SessionInfo:
     duration: float = 5.0          # Video length in seconds
     output_fps: int = 24           # Output framerate after RIFE interpolation
     enable_upscale: bool = False
+    upscale_model: str = "models/upscale_models/4xRealWebPhoto_v4_dat2.pth"
     boundary_ratio: float = 0.9    # High/low noise boundary split (official model default)
     distill_lora_mode: bool = False # True = fast 4-step distill, False = quality mode
 
@@ -135,6 +136,7 @@ class SessionManager:
             duration=float(params.get("duration", 5.0)),
             output_fps=int(params.get("output_fps", 24)),
             enable_upscale=bool(params.get("enable_upscale", False)),
+            upscale_model=params.get("upscale_model", "models/upscale_models/4xRealWebPhoto_v4_dat2.pth"),
             boundary_ratio=float(params.get("boundary_ratio", 0.9)),
             lora_scales=params.get("lora_scales", []),
             distill_lora_mode=bool(params.get("distill_lora_mode", False)),

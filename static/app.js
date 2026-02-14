@@ -711,6 +711,9 @@
       setParam("boundary-ratio", d.boundary_ratio || 0.9);
       $("#seed").value = d.seed || 42;
       $("#enable-upscale").checked = d.enable_upscale || false;
+      if (d.upscale_model && $("#upscale-model")) {
+        $("#upscale-model").value = d.upscale_model;
+      }
 
       // Restore mode toggle based on session's distill_lora_mode
       applyMode(d.distill_lora_mode ? "fast" : "quality", /* silent */ true);
@@ -841,6 +844,7 @@
       boundary_ratio:      parseFloat($("#boundary-ratio").value),
       seed:                parseInt($("#seed").value),
       enable_upscale:      $("#enable-upscale").checked,
+      upscale_model:       $("#upscale-model") ? $("#upscale-model").value : "",
       lora_scales:         loraScales,
       distill_lora_mode:   currentMode === "fast",
       // Memory settings
@@ -916,6 +920,12 @@
         if (upscaleCheckbox) upscaleCheckbox.checked = true;
       } else if (upscaleCheckbox) {
         payload.enable_upscale = upscaleCheckbox.checked;
+      }
+
+      // Also send the current upscale model selection
+      const upscaleModelSel = $("#upscale-model");
+      if (upscaleModelSel) {
+        payload.upscale_model = upscaleModelSel.value;
       }
 
       const r = await fetch(`/api/resume/${currentSessionId}`, {

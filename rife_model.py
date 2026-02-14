@@ -225,6 +225,10 @@ def interpolate_sequence(model: IFNet, frames: list[np.ndarray],
     """
     Interpolate a sequence of frames to reach a target FPS.
 
+    Uses time-accurate resampling: each output frame is placed at its exact
+    time position, and we interpolate between the two nearest source frames.
+    This preserves the original video duration exactly.
+
     Args:
         model:      Loaded IFNet model
         frames:     List of HWC uint8 numpy arrays
@@ -239,24 +243,46 @@ def interpolate_sequence(model: IFNet, frames: list[np.ndarray],
     if target_fps <= source_fps:
         return frames  # No interpolation needed
 
-    # Calculate the multiplication factor
-    ratio = target_fps / source_fps
-    total_pairs = len(frames) - 1
-    result = [frames[0]]
+    n_src = len(frames)
+    if n_src < 2:
+        return frames
 
-    for i in range(total_pairs):
-        # Number of intermediate frames to insert between frame[i] and frame[i+1]
-        # For ratio=2, we insert 1 frame; ratio=3, we insert 2; ratio=4, we insert 3
-        n_interp = round(ratio) - 1
+    # Compute exact duration and target frame count
+    duration = (n_src - 1) / source_fps  # time from first to last frame
+    n_target = round(duration * target_fps) + 1  # +1 for the first frame at t=0
 
-        for j in range(1, n_interp + 1):
-            t = j / (n_interp + 1)
-            mid = interpolate_frame(model, frames[i], frames[i + 1], t, device)
+    result = []
+    total_interp = 0
+
+    for i in range(n_target):
+        # Time position of this output frame
+        t = i / target_fps
+        # Corresponding fractional source frame index
+        src_pos = t * source_fps
+        src_lo = int(src_pos)
+        src_hi = min(src_lo + 1, n_src - 1)
+        blend = src_pos - src_lo
+
+        if blend < 0.001 or src_lo == src_hi:
+            # Close enough to an original frame — use it directly
+            result.append(frames[min(src_lo, n_src - 1)])
+        elif blend > 0.999:
+            # Close enough to the next frame
+            result.append(frames[src_hi])
+        else:
+            # Interpolate between src_lo and src_hi
+            mid = interpolate_frame(model, frames[src_lo], frames[src_hi],
+                                    blend, device)
             result.append(mid)
+            total_interp += 1
 
-        result.append(frames[i + 1])
+        if progress_fn and ((i + 1) % 10 == 0 or (i + 1) == n_target):
+            progress_fn(i + 1, n_target)
 
-        if progress_fn:
-            progress_fn(i + 1, total_pairs)
+    print(f"    Resampled {n_src} frames @ {source_fps}fps → "
+          f"{len(result)} frames @ {target_fps}fps "
+          f"({total_interp} interpolated, {len(result) - total_interp} original)")
+    print(f"    Duration preserved: {duration:.3f}s → "
+          f"{(len(result) - 1) / target_fps:.3f}s")
 
     return result

@@ -195,6 +195,14 @@
                   Enable 4× Upscale + RIFE
                 </label>
               </div>
+              <div class="param-item" id="upscale-model-wrap">
+                <label for="upscale-model">Upscale Model</label>
+                <select id="upscale-model" class="param-select">
+                  {% for m in upscale_models %}
+                  <option value="{{ m.path }}" {% if m.path == config.get('upscale_model', '') %}selected{% endif %}>{{ m.name }}</option>
+                  {% endfor %}
+                </select>
+              </div>
             </div>
 
           </div>

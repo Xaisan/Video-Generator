@@ -19,8 +19,8 @@ from pathlib import Path
 
 def load_upscale_model(model_path: str, device: torch.device):
     """
-    Load an upscale model via spandrel (supports ESRGAN, SwinIR, etc).
-    Returns (model, scale_factor) or (None, 4) on failure.
+    Load an upscale model via spandrel (supports ESRGAN, SwinIR, DAT, etc).
+    Returns (model, scale_factor, arch_name) or (None, 4, "none") on failure.
     """
     try:
         from spandrel import ModelLoader
@@ -30,12 +30,15 @@ def load_upscale_model(model_path: str, device: torch.device):
             scale = model.scale
         else:
             scale = 4
-        print(f"  Loaded upscale model: {Path(model_path).name} (scale={scale})")
-        return model, scale
+        arch_name = type(model.model).__name__ if hasattr(model, 'model') else "Unknown"
+        num_params = sum(p.numel() for p in model.parameters()) / 1e6
+        print(f"  Loaded upscale model: {Path(model_path).name}")
+        print(f"    Architecture: {arch_name}, Scale: {scale}×, Params: {num_params:.1f}M")
+        return model, scale, arch_name
     except Exception as e:
         print(f"  ⚠  Failed to load upscale model: {e}")
         print("  ⚠  Falling back to bicubic 4×")
-        return None, 4
+        return None, 4, "none"
 
 
 def tile_upscale(model, img_tensor: torch.Tensor, tile_size: int = 256,
@@ -84,7 +87,8 @@ def tile_upscale(model, img_tensor: torch.Tensor, tile_size: int = 256,
     return output
 
 
-def upscale_frame(model, frame_np: np.ndarray, device: torch.device) -> np.ndarray:
+def upscale_frame(model, frame_np: np.ndarray, device: torch.device,
+                  tile_size: int = 384, tile_pad: int = 32) -> np.ndarray:
     """Upscale a single HWC uint8 frame."""
     if model is None:
         from PIL import Image
@@ -96,11 +100,27 @@ def upscale_frame(model, frame_np: np.ndarray, device: torch.device) -> np.ndarr
     img_t = torch.from_numpy(frame_np).permute(2, 0, 1).unsqueeze(0)
     img_t = img_t.to(device=device, dtype=torch.float32) / 255.0
 
-    result = tile_upscale(model, img_t, tile_size=192, tile_pad=16)
+    result = tile_upscale(model, img_t, tile_size=tile_size, tile_pad=tile_pad)
 
     result = result.squeeze(0).permute(1, 2, 0).clamp(0, 1)
     result = (result * 255).to(torch.uint8).cpu().numpy()
     return result
+
+
+def _choose_tile_size(arch_name: str) -> tuple:
+    """
+    Choose tile_size and tile_pad based on model architecture.
+    Transformer-based architectures (DAT, SwinIR, HAT, etc.) need smaller
+    tiles than CNN-based ones (ESRGAN/RRDB) due to self-attention memory.
+    """
+    # Transformer / attention-based — use smaller tiles to avoid OOM
+    attn_archs = {"DAT", "SwinIR", "Swin2SR", "HAT", "SRFormer", "ATD",
+                  "RGT", "DRCT", "GRL", "DITN", "Restormer", "IPT"}
+    for a in attn_archs:
+        if a.lower() in arch_name.lower():
+            return 256, 24
+    # CNN-based (ESRGAN, RRDB, SRVGGNet, SPAN, etc.) — can use larger tiles
+    return 384, 32
 
 
 def _flush():
@@ -111,7 +131,8 @@ def _flush():
 
 # ─── Main upscale pipeline ──────────────────────────────────────
 
-def upscale_video(input_path: str, output_path: str, cfg: dict):
+def upscale_video(input_path: str, output_path: str, cfg: dict,
+                  progress_fn=None):
     """
     Full upscale pipeline:
       1. Read input video frames
@@ -124,6 +145,8 @@ def upscale_video(input_path: str, output_path: str, cfg: dict):
       output_fps    — desired output framerate (default = fps, no interpolation)
       upscale_model — path to spatial upscale model
       rife_model    — path to RIFE .pth (default: models/upscale_models/rife47.pth)
+
+    progress_fn: optional callback(percent: int, msg: str) for UI updates
     """
     import imageio.v3 as iio
 
@@ -142,13 +165,18 @@ def upscale_video(input_path: str, output_path: str, cfg: dict):
         rife_path = cfg.get("rife_model", "models/upscale_models/rife47.pth")
         if os.path.isfile(rife_path):
             print(f"  🎞  Frame interpolation: {source_fps}fps → {output_fps}fps using RIFE")
+            if progress_fn:
+                progress_fn(5, f"RIFE interpolation: {source_fps}→{output_fps}fps…")
             from rife_model import load_rife_model, interpolate_sequence
 
             rife = load_rife_model(rife_path, device)
             if rife is not None:
                 def rife_progress(cur, total):
                     if cur % 10 == 0 or cur == total:
-                        print(f"    RIFE interpolation: {cur}/{total} pairs")
+                        print(f"    RIFE interpolation: {cur}/{total} frames")
+                    if progress_fn:
+                        pct = 5 + int(25 * cur / total)
+                        progress_fn(pct, f"RIFE: {cur}/{total} frames")
 
                 frames = interpolate_sequence(
                     rife, frames,
@@ -174,17 +202,25 @@ def upscale_video(input_path: str, output_path: str, cfg: dict):
         output_fps = source_fps  # Don't reduce fps
 
     # ── Phase 2: Spatial 4× upscale ──
-    model_path = cfg.get("upscale_model", "models/upscale_models/4x_NMKD-Siax_200k.pth")
+    model_path = cfg.get("upscale_model", "models/upscale_models/4xRealWebPhoto_v4_dat2.pth")
     print(f"  🔍 Spatial upscale with {Path(model_path).name}")
-    model, scale = load_upscale_model(model_path, device)
+    if progress_fn:
+        progress_fn(35, f"Loading upscale model…")
+    model, scale, arch_name = load_upscale_model(model_path, device)
+    tile_size, tile_pad = _choose_tile_size(arch_name)
+    print(f"    Tile size: {tile_size}px, pad: {tile_pad}px (arch: {arch_name})")
 
     upscaled = []
     total = len(frames)
     for i, frame in enumerate(frames):
-        up = upscale_frame(model, frame, device)
+        up = upscale_frame(model, frame, device,
+                           tile_size=tile_size, tile_pad=tile_pad)
         upscaled.append(up)
         if (i + 1) % 5 == 0 or (i + 1) == total:
             print(f"    Spatial upscale: frame {i+1}/{total}")
+        if progress_fn:
+            pct = 35 + int(60 * (i + 1) / total)
+            progress_fn(pct, f"Spatial {scale}×: {i+1}/{total} frames")
 
     # Free spatial model
     del model
@@ -192,9 +228,23 @@ def upscale_video(input_path: str, output_path: str, cfg: dict):
 
     # ── Write output ──
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    iio.imwrite(output_path, np.stack(upscaled), fps=output_fps, codec="libx264")
-    print(f"  ✅ Upscaled video: {output_path} "
-          f"({scale}× spatial, {output_fps}fps, {len(upscaled)} frames)")
+
+    import imageio
+    h, w = upscaled[0].shape[:2]
+    writer = imageio.get_writer(
+        output_path, fps=output_fps, codec="libx264",
+        quality=8, pixelformat="yuv420p",
+    )
+    for frame in upscaled:
+        writer.append_data(frame)
+    writer.close()
+
+    # Report
+    src_h, src_w = frames[0].shape[:2] if frames else (0, 0)
+    print(f"  ✅ Upscaled video: {output_path}")
+    print(f"     {src_w}×{src_h} → {w}×{h} ({scale}× spatial)")
+    print(f"     {output_fps}fps, {len(upscaled)} frames, "
+          f"duration={(len(upscaled))/output_fps:.2f}s")
 
 
 if __name__ == "__main__":

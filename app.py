@@ -151,10 +151,23 @@ def index():
     sessions = sm.list_sessions(limit=100)
     config = get_cfg()
     loras = config.get("loras", [])
+
+    # Scan available upscale models
+    upscale_dir = Path("models/upscale_models")
+    upscale_models = []
+    if upscale_dir.is_dir():
+        for f in sorted(upscale_dir.iterdir()):
+            if f.suffix in (".pth", ".safetensors") and "rife" not in f.name.lower():
+                upscale_models.append({
+                    "path": str(f),
+                    "name": f.stem,
+                })
+
     return render_template("index.html",
                            sessions=[s.to_dict() for s in sessions],
                            config=config,
                            loras=loras,
+                           upscale_models=upscale_models,
                            step_order=STEP_ORDER)
 
 
@@ -227,6 +240,7 @@ def api_generate():
             "duration": float(data.get("duration", config.get("duration", 5.0))),
             "output_fps": int(data.get("output_fps", config.get("output_fps", 24))),
             "enable_upscale": data.get("enable_upscale", False),
+            "upscale_model": data.get("upscale_model", config.get("upscale_model", "models/upscale_models/4xRealWebPhoto_v4_dat2.pth")),
             "lora_scales": data.get("lora_scales", []),
             "boundary_ratio": float(data.get("boundary_ratio", config.get("boundary_ratio", 0.9))),
             "distill_lora_mode": bool(data.get("distill_lora_mode", config.get("distill_lora_mode", False))),
@@ -328,6 +342,8 @@ def api_resume(session_id):
             info.lora_scales = data["lora_scales"]
         if "enable_upscale" in data:
             info.enable_upscale = bool(data["enable_upscale"])
+        if "upscale_model" in data:
+            info.upscale_model = data["upscale_model"]
         if "output_fps" in data:
             info.output_fps = int(data["output_fps"])
         if "duration" in data:
@@ -433,6 +449,7 @@ def api_clone_session(session_id):
         "duration": d.get("duration", 5.0),
         "output_fps": d.get("output_fps", 24),
         "enable_upscale": d.get("enable_upscale", False),
+        "upscale_model": d.get("upscale_model", ""),
         "lora_scales": d.get("lora_scales", []),
         "boundary_ratio": d.get("boundary_ratio", 0.5),
         # input image served from session dir
