@@ -762,6 +762,7 @@ class PipelineEngine:
             # ══════════════════════════════════════════════════════════
             #  PHASE 1: VAE encode input image → latents + condition
             # ══════════════════════════════════════════════════════════
+            vae_device = "cpu" if force_vae_cpu else "cuda"
             self._emit(session_id, "denoise", 3, "Loading VAE…")
             if self._slog:
                 self._slog.log("denoise", f"PHASE 1: VAE encode (device={vae_device}, tiling={cfg.get('vae_tiling', True)}, slicing={cfg.get('vae_slicing', True)})")
@@ -771,8 +772,6 @@ class PipelineEngine:
                 vae.enable_tiling()
             if cfg.get("vae_slicing", True):
                 vae.enable_slicing()
-
-            vae_device = "cpu" if force_vae_cpu else "cuda"
             vae.to(vae_device)
             print(f"  VAE on {vae_device}. VRAM: {vram_stats()}", flush=True)
             if self._slog:
