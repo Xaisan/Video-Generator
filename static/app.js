@@ -903,10 +903,25 @@
     );
     if (!confirmed) return;
     try {
+      // Always send current UI state for enable_upscale so the session
+      // gets updated — covers the case where the user forgot to check
+      // upscale initially but wants it on resume.
+      const payload = { from_step: step };
+      const upscaleCheckbox = $("#enable-upscale");
+
+      // If resuming specifically from "upscale", force it on — the user
+      // clearly wants to upscale if they clicked play on that step.
+      if (step === "upscale") {
+        payload.enable_upscale = true;
+        if (upscaleCheckbox) upscaleCheckbox.checked = true;
+      } else if (upscaleCheckbox) {
+        payload.enable_upscale = upscaleCheckbox.checked;
+      }
+
       const r = await fetch(`/api/resume/${currentSessionId}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ from_step: step }),
+        body: JSON.stringify(payload),
       });
       const d = await r.json();
       if (d.error) { toast("Error: " + d.error, "error"); return; }
