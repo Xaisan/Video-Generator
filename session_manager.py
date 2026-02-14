@@ -137,6 +137,7 @@ class SessionManager:
             enable_upscale=bool(params.get("enable_upscale", False)),
             boundary_ratio=float(params.get("boundary_ratio", 0.5)),
             lora_scales=params.get("lora_scales", []),
+            distill_lora_mode=bool(params.get("distill_lora_mode", False)),
         )
 
         # Copy input image into session
