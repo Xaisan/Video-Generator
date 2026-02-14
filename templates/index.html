@@ -320,6 +320,13 @@
               <div class="step-progress-fill"></div>
             </div>
             <div class="step-time"></div>
+            {% if step == 'upscale' %}
+            <select class="upscale-step-select" style="max-width:140px;height:24px;font-size:11px;padding:0 4px;margin-right:8px;background:var(--bg-card);color:var(--text-color);border:1px solid var(--border-color);border-radius:4px;">
+              {% for m in upscale_models %}
+              <option value="{{ m.path }}">{{ m.name }}</option>
+              {% endfor %}
+            </select>
+            {% endif %}
             <button class="btn btn-xs btn-ghost btn-resume" data-step="{{ step }}" title="Resume from this step">▶</button>
           </div>
           {% endfor %}

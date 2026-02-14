@@ -559,6 +559,15 @@
       const timeEl = card.querySelector(".step-time");
       if (s.step_times && s.step_times[step]) timeEl.textContent = formatStepTime(s.step_times[step]);
       else timeEl.textContent = "";
+
+      // Ensure upscale model dropdown reflects session state ONLY if not focused
+      // Prevents overwriting user selection while they're changing it
+      if (step === "upscale" && s.upscale_model) {
+        const uSelect = card.querySelector("select");
+        if (uSelect && document.activeElement !== uSelect) {
+            uSelect.value = s.upscale_model;
+        }
+      }
     });
 
     $("#info-prompt").textContent = s.prompt || "—";
@@ -923,9 +932,14 @@
       }
 
       // Also send the current upscale model selection
-      const upscaleModelSel = $("#upscale-model");
-      if (upscaleModelSel) {
-        payload.upscale_model = upscaleModelSel.value;
+      // Priority: Dropdown in the upscale step card > Main panel dropdown
+      const stepUpscaleSelect = $('.step-card[data-step="upscale"] select');
+      const mainUpscaleSelect = $("#upscale-model");
+      
+      if (stepUpscaleSelect) {
+        payload.upscale_model = stepUpscaleSelect.value;
+      } else if (mainUpscaleSelect) {
+        payload.upscale_model = mainUpscaleSelect.value;
       }
 
       const r = await fetch(`/api/resume/${currentSessionId}`, {

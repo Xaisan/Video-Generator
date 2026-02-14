@@ -30,8 +30,16 @@ def load_upscale_model(model_path: str, device: torch.device):
             scale = model.scale
         else:
             scale = 4
-        arch_name = type(model.model).__name__ if hasattr(model, 'model') else "Unknown"
-        num_params = sum(p.numel() for p in model.parameters()) / 1e6
+        
+        # spandrel wraps the actual model in model.model
+        if hasattr(model, 'model'):
+            arch_name = type(model.model).__name__
+            num_params = sum(p.numel() for p in model.model.parameters()) / 1e6
+        else:
+            # Fallback if no .model attribute (e.g. if it's a bare module)
+            arch_name = type(model).__name__
+            num_params = sum(p.numel() for p in model.parameters()) / 1e6
+            
         print(f"  Loaded upscale model: {Path(model_path).name}")
         print(f"    Architecture: {arch_name}, Scale: {scale}×, Params: {num_params:.1f}M")
         return model, scale, arch_name
