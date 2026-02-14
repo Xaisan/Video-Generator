@@ -575,6 +575,72 @@ input[type="range"]:focus::-moz-range-thumb {
   background: var(--badge-low);
   color: var(--badge-low-text);
 }
+.badge-distill {
+  background: #2a1a3a;
+  color: #d19af8;
+  font-size: 11px;
+}
+[data-theme="light"] .badge-distill {
+  background: #f0e6ff;
+  color: #7c3aed;
+}
+
+/* Distill LoRA cards — dimmed in quality mode */
+.lora-card.lora-distill.lora-disabled {
+  opacity: 0.35;
+  pointer-events: none;
+  filter: grayscale(0.6);
+}
+.lora-card.lora-distill.lora-disabled::after {
+  content: "Disabled in Quality mode";
+  font-size: 10px;
+  color: var(--text-muted);
+  text-align: center;
+  font-style: italic;
+}
+
+/* ── Mode toggle ──────────────────────────────────────────────── */
+.mode-toggle-section {
+  margin: 12px 20px 4px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+.mode-toggle {
+  display: flex;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.mode-btn {
+  padding: 8px 20px;
+  font-size: 14px;
+  font-weight: 600;
+  border: none;
+  background: var(--bg);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all .15s;
+}
+.mode-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.mode-btn.active {
+  background: var(--accent-dim);
+  color: #fff;
+}
+.mode-btn[data-mode="fast"].active {
+  background: #7c3aed;
+  color: #fff;
+}
+.mode-hint {
+  font-size: 12px;
+  color: var(--text-dim);
+  padding-left: 4px;
+}
 
 .lora-control {
   display: flex;

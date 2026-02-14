@@ -23,15 +23,18 @@ Memory strategy (denoise step):
 """
 
 import gc
+import math
 import os
 import sys
 import time
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 from PIL import Image
 
@@ -85,6 +88,170 @@ def apply_amd_env(cfg: dict) -> None:
     os.environ["PYTORCH_ALLOC_CONF"] = alloc_conf
     os.environ["PYTORCH_HIP_ALLOC_CONF"] = alloc_conf
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+# ─── Chunked SDPA for GPUs without flash/mem-efficient attention ───
+#
+# On ROCm (AMD RDNA3/RDNA2), PyTorch's scaled_dot_product_attention
+# falls back to the naive "math" backend that materialises the FULL
+# [B, H, N, N] attention matrix.  For large sequence lengths (e.g.
+# 131 K tokens at 832×480×81 frames) this can be 160+ GiB — instant OOM.
+#
+# The function below processes attention **one head at a time** and
+# chunks the query dimension, keeping peak memory bounded to roughly:
+#   chunk_size × N × sizeof(dtype) per step  (~256 MB with defaults).
+#
+# This is the same mathematical operation as regular SDPA; only the
+# memory access pattern changes.  Quality is bit-identical.
+# ────────────────────────────────────────────────────────────────────
+
+_ORIGINAL_SDPA = F.scaled_dot_product_attention   # keep a reference
+
+
+def _sdpa_backends_available() -> dict:
+    """Probe which SDPA backends PyTorch actually supports on this GPU."""
+    result = {"flash": False, "mem_efficient": False, "math": True}
+    if not torch.cuda.is_available():
+        return result
+    try:
+        q = torch.randn(1, 1, 8, 64, device="cuda", dtype=torch.float16)
+        k = torch.randn(1, 1, 8, 64, device="cuda", dtype=torch.float16)
+        v = torch.randn(1, 1, 8, 64, device="cuda", dtype=torch.float16)
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=True, enable_mem_efficient=False, enable_math=False
+        ):
+            try:
+                _ = _ORIGINAL_SDPA(q, k, v)
+                result["flash"] = True
+            except Exception:
+                pass
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False, enable_mem_efficient=True, enable_math=False
+        ):
+            try:
+                _ = _ORIGINAL_SDPA(q, k, v)
+                result["mem_efficient"] = True
+            except Exception:
+                pass
+        del q, k, v
+        flush_vram()
+    except Exception:
+        pass
+    return result
+
+
+def _chunked_sdpa(
+    query, key, value,
+    attn_mask=None, dropout_p=0.0, is_causal=False, scale=None,
+    enable_gqa=False,
+):
+    """Memory-efficient SDPA via head-by-head + query-chunked computation.
+
+    Processes one head at a time and chunks the query sequence so the
+    intermediate attention-score tensor is never larger than
+    [1, chunk_size, N] — roughly 256 MB instead of 160 GiB.
+    """
+    B, H, N, D = query.shape
+    _, Hk, Nk, Dk = key.shape
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(D)
+
+    # For short sequences, just use normal SDPA (math backend is fine)
+    # Threshold: attention matrix < 512 MB ≈ N*Nk*2 < 512M → N < ~16k
+    if N * Nk * 2 < 512 * 1024 * 1024:
+        return _ORIGINAL_SDPA(
+            query, key, value, attn_mask=attn_mask,
+            dropout_p=dropout_p, is_causal=is_causal, scale=scale,
+            enable_gqa=enable_gqa,
+        )
+
+    # Adaptive chunk size: keep per-chunk attention matrix ≤ target_mb
+    target_bytes = 256 * 1024 * 1024   # 256 MiB
+    elem_size = 4 if query.dtype == torch.float32 else 2
+    chunk_size = max(256, target_bytes // (Nk * elem_size))
+    chunk_size = min(chunk_size, N)
+
+    # GQA: repeat K/V heads to match Q head count
+    heads_per_kv = H // Hk
+    output = torch.empty_like(query)
+
+    for h in range(H):
+        kv_h = h // heads_per_kv
+        q_h = query[:, h]            # [B, N, D]
+        k_h = key[:, kv_h]           # [B, Nk, Dk]
+        v_h = value[:, kv_h]         # [B, Nk, Dk]
+
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            q_chunk = q_h[:, start:end]                          # [B, chunk, D]
+            scores = torch.bmm(q_chunk, k_h.transpose(-2, -1))  # [B, chunk, Nk]
+            scores = scores * scale
+
+            if attn_mask is not None:
+                if attn_mask.dim() == 4:
+                    scores = scores + attn_mask[:, h, start:end, :Nk]
+                elif attn_mask.dim() == 2:
+                    scores = scores + attn_mask[start:end, :Nk]
+
+            if is_causal:
+                row_idx = torch.arange(start, end, device=scores.device).unsqueeze(1)
+                col_idx = torch.arange(Nk, device=scores.device).unsqueeze(0)
+                causal = col_idx > row_idx
+                scores = scores.masked_fill(causal, float("-inf"))
+
+            scores = scores.softmax(dim=-1)
+
+            if dropout_p > 0 and query.requires_grad:
+                scores = F.dropout(scores, p=dropout_p)
+
+            out_chunk = torch.bmm(scores, v_h)                  # [B, chunk, D]
+            output[:, h, start:end] = out_chunk
+
+    return output
+
+
+@contextmanager
+def patched_sdpa(enabled: bool = True):
+    """Context manager that replaces F.scaled_dot_product_attention with
+    the chunked version for the duration of the block."""
+    if not enabled:
+        yield
+        return
+    original = torch.nn.functional.scaled_dot_product_attention
+    torch.nn.functional.scaled_dot_product_attention = _chunked_sdpa
+    print("  [SDPA] Chunked attention ENABLED (no flash/mem-efficient on this GPU)")
+    try:
+        yield
+    finally:
+        torch.nn.functional.scaled_dot_product_attention = original
+        print("  [SDPA] Restored original SDPA")
+
+
+def _resolve_chunked_attention(cfg: dict) -> bool:
+    """Decide whether to enable chunked SDPA based on config + GPU probe.
+
+    Returns True if chunked SDPA should be used.
+    """
+    mode = cfg.get("chunked_attention", "auto")
+    if mode == "off":
+        print("  [SDPA] Chunked attention: OFF (config)")
+        return False
+    if mode == "on":
+        print("  [SDPA] Chunked attention: ON (forced by config)")
+        return True
+    # mode == "auto" — probe the GPU
+    backends = _sdpa_backends_available()
+    has_efficient = backends["flash"] or backends["mem_efficient"]
+    print(f"  [SDPA] Backend probe: flash={backends['flash']}, "
+          f"mem_efficient={backends['mem_efficient']}, math={backends['math']}")
+    if has_efficient:
+        print("  [SDPA] Chunked attention: OFF (flash/mem-efficient available)")
+        return False
+    else:
+        print("  [SDPA] Chunked attention: ON (only math backend available — "
+              "chunking prevents OOM)")
+        return True
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -255,7 +422,8 @@ def load_scheduler(cfg: dict):
 # ─── LoRA loading (per-transformer) ───────────────────────────────
 def apply_loras_to_transformer(pipe, cfg: dict, target: str,
                                lora_overrides: list | None = None,
-                               load_as_primary: bool = False):
+                               load_as_primary: bool = False,
+                               distill_lora_mode: bool = False):
     """Load LoRAs for a SINGLE transformer target.
 
     target: "transformer" or "transformer_2" — used to FILTER config entries.
@@ -263,6 +431,8 @@ def apply_loras_to_transformer(pipe, cfg: dict, target: str,
                      "transformer_2".  Needed when the low-noise transformer
                      is mounted as pipe.transformer (because load_lora_weights
                      requires a non-None .transformer to read its config).
+    distill_lora_mode: if False, skip LoRAs with role="distill" (LightX2V, t2v_speed).
+                       If True, load all LoRAs including distillation ones.
 
     This avoids loading all LoRAs at once (halves RAM pressure) and
     prevents the duplicate peft_config warning.
@@ -286,7 +456,16 @@ def apply_loras_to_transformer(pipe, cfg: dict, target: str,
 
     # Filter to only LoRAs for this target
     target_loras = [l for l in lora_cfgs if l.get("target", "transformer") == target]
+
+    # Filter by role: skip distill LoRAs in quality mode
+    if not distill_lora_mode:
+        skipped = [l["adapter_name"] for l in target_loras if l.get("role") == "distill"]
+        if skipped:
+            print(f"  ⏭ Quality mode: skipping distill LoRAs: {skipped}")
+        target_loras = [l for l in target_loras if l.get("role") != "distill"]
+
     if not target_loras:
+        print(f"  No LoRAs to load for {target}")
         return
 
     adapters = []
@@ -427,6 +606,8 @@ class SessionLogger:
             f.write(f"  Alloc conf:   {os.environ.get('PYTORCH_HIP_ALLOC_CONF', 'N/A')}\n\n")
 
             f.write("── Generation Parameters ──\n")
+            distill = getattr(info, "distill_lora_mode", False)
+            f.write(f"  Mode:             {'⚡ DISTILL (fast 4-step)' if distill else '🎨 QUALITY (full CFG)'}\n")
             f.write(f"  Prompt:           {info.prompt}\n")
             f.write(f"  Negative prompt:  {info.negative_prompt}\n")
             f.write(f"  Resolution:       {info.width}×{info.height} ({info.width*info.height/1e6:.2f} MP)\n")
@@ -459,6 +640,10 @@ class SessionLogger:
                         scale = lora_overrides[i]
                 target = lora.get("target", "transformer")
                 badge = "HIGH" if target == "transformer" else "LOW"
+                role = lora.get("role", "quality")
+                role_badge = "DISTILL" if role == "distill" else "QUALITY"
+                skipped = (not distill and role == "distill")
+                status = "SKIP" if skipped else "LOAD"
                 path = lora.get("path", "")
                 file_size = "?"
                 try:
@@ -467,6 +652,7 @@ class SessionLogger:
                 except OSError:
                     pass
                 f.write(f"  [{i}] {lora['adapter_name']:40s}  {badge:4s}  "
+                        f"{role_badge:7s}  {status:4s}  "
                         f"scale={scale:<6.3f}  {file_size:>10s}  {os.path.basename(path)}\n")
             f.write("\n")
 
@@ -821,6 +1007,35 @@ class PipelineEngine:
             force_vae_cpu = cfg.get("force_vae_cpu", False)
             flow_shift = cfg.get("flow_shift", 8.0)
 
+            # ── Distill LoRA mode detection ──
+            # When distill_lora_mode=True, LightX2V CFG-distilled LoRAs are used.
+            # This REQUIRES: CFG=1.0 (guidance baked into weights),
+            # 4 steps (what the model was trained on), flow_shift=5.0.
+            distill_lora_mode = getattr(info, "distill_lora_mode", False)
+            if distill_lora_mode:
+                print("  ⚡ DISTILL MODE: LightX2V enabled — "
+                      "forcing CFG=1.0, 4 steps, flow_shift=5.0")
+                # Force the correct parameters for distilled inference
+                info.guidance_scale = 1.0
+                info.guidance_scale_2 = 1.0
+                info.num_inference_steps = 4
+                flow_shift = 5.0
+                if self._slog:
+                    self._slog.log("denoise", "⚡ DISTILL MODE ACTIVE")
+                    self._slog.log("denoise", "  → CFG forced to 1.0 (baked into distill weights)")
+                    self._slog.log("denoise", "  → Steps forced to 4 (distill training schedule)")
+                    self._slog.log("denoise", "  → flow_shift forced to 5.0 (LightX2V recommendation)")
+            else:
+                print("  🎨 QUALITY MODE: distill LoRAs disabled, "
+                      "using full CFG + standard steps")
+                if self._slog:
+                    self._slog.log("denoise", "🎨 QUALITY MODE — distill LoRAs will be skipped")
+
+            # ── Chunked SDPA resolution ──
+            use_chunked_sdpa = _resolve_chunked_attention(cfg)
+            if self._slog:
+                self._slog.log("denoise", f"Chunked SDPA: {'ENABLED' if use_chunked_sdpa else 'disabled'}")
+
             # Load scheduler config
             sched = UniPCMultistepScheduler.from_pretrained(
                 cfg["model_id"], subfolder="scheduler",
@@ -1076,7 +1291,8 @@ class PipelineEngine:
                 # LoRAs for high-noise ONLY
                 self._emit(session_id, "denoise", 24, "Loading high-noise LoRAs…")
                 apply_loras_to_transformer(pipe_pass1, cfg, "transformer",
-                                           info.lora_scales)
+                                           info.lora_scales,
+                                           distill_lora_mode=distill_lora_mode)
                 print(f"  VRAM after high-noise LoRAs: {vram_stats()}")
                 if self._slog:
                     self._slog.vram_event("denoise", "high-noise LoRAs applied")
@@ -1106,50 +1322,51 @@ class PipelineEngine:
                       f"(timesteps: {[int(timesteps[i]) for i in high_indices]})")
 
                 # ── Denoise loop (Pass 1: high-noise) ──
-                for step_idx in high_indices:
-                    if self._cancel_flag:
-                        raise InterruptedError("Generation cancelled by user")
+                with patched_sdpa(use_chunked_sdpa):
+                    for step_idx in high_indices:
+                        if self._cancel_flag:
+                            raise InterruptedError("Generation cancelled by user")
 
-                    t = timesteps[step_idx]
-                    i_global = step_idx  # absolute position in schedule
-                    pct = 25 + int(50 * (i_global + 1) / num_inference_steps)
-                    gpu_gb = vram_stats().get("allocated_gb", 0)
-                    self._emit(session_id, "denoise", pct,
-                               f"Pass 1 step {step_idx+1}/{num_inference_steps} "
-                               f"(t={t:.0f}, GPU: {gpu_gb:.1f} GB)")
+                        t = timesteps[step_idx]
+                        i_global = step_idx  # absolute position in schedule
+                        pct = 25 + int(50 * (i_global + 1) / num_inference_steps)
+                        gpu_gb = vram_stats().get("allocated_gb", 0)
+                        self._emit(session_id, "denoise", pct,
+                                   f"Pass 1 step {step_idx+1}/{num_inference_steps} "
+                                   f"(t={t:.0f}, GPU: {gpu_gb:.1f} GB)")
 
-                    latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
-                    timestep = t.expand(latents.shape[0])
+                        latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
+                        timestep = t.expand(latents.shape[0])
 
-                    with torch.no_grad():
-                        with current_model.cache_context("cond"):
-                            noise_pred = current_model(
-                                hidden_states=latent_model_input,
-                                timestep=timestep,
-                                encoder_hidden_states=prompt_embeds,
-                                encoder_hidden_states_image=image_embeds,
-                                return_dict=False,
-                            )[0]
-
-                        if do_cfg:
-                            with current_model.cache_context("uncond"):
-                                noise_uncond = current_model(
+                        with torch.no_grad():
+                            with current_model.cache_context("cond"):
+                                noise_pred = current_model(
                                     hidden_states=latent_model_input,
                                     timestep=timestep,
-                                    encoder_hidden_states=negative_prompt_embeds,
+                                    encoder_hidden_states=prompt_embeds,
                                     encoder_hidden_states_image=image_embeds,
                                     return_dict=False,
                                 )[0]
-                            noise_pred = noise_uncond + guidance_scale * (
-                                noise_pred - noise_uncond)
 
-                    latents = main_sched.step(noise_pred, t, latents,
-                                              return_dict=False)[0]
-                    if self._slog:
-                        self._slog.log_denoise_step("denoise", 1, step_idx,
-                                                    num_inference_steps, float(t))
-                        self._slog.vram_denoise_sample("denoise", 1, step_idx,
-                                                       num_inference_steps, float(t))
+                            if do_cfg:
+                                with current_model.cache_context("uncond"):
+                                    noise_uncond = current_model(
+                                        hidden_states=latent_model_input,
+                                        timestep=timestep,
+                                        encoder_hidden_states=negative_prompt_embeds,
+                                        encoder_hidden_states_image=image_embeds,
+                                        return_dict=False,
+                                    )[0]
+                                noise_pred = noise_uncond + guidance_scale * (
+                                    noise_pred - noise_uncond)
+
+                        latents = main_sched.step(noise_pred, t, latents,
+                                                  return_dict=False)[0]
+                        if self._slog:
+                            self._slog.log_denoise_step("denoise", 1, step_idx,
+                                                        num_inference_steps, float(t))
+                            self._slog.vram_denoise_sample("denoise", 1, step_idx,
+                                                           num_inference_steps, float(t))
 
                 print(f"  Pass 1 complete. VRAM: {vram_stats()}")
                 if self._slog:
@@ -1196,7 +1413,8 @@ class PipelineEngine:
                 self._emit(session_id, "denoise", 54, "Loading low-noise LoRAs…")
                 apply_loras_to_transformer(pipe_pass2, cfg, "transformer_2",
                                            info.lora_scales,
-                                           load_as_primary=True)
+                                           load_as_primary=True,
+                                           distill_lora_mode=distill_lora_mode)
                 print(f"  VRAM after low-noise LoRAs: {vram_stats()}")
                 if self._slog:
                     self._slog.vram_event("denoise", "low-noise LoRAs applied")
@@ -1227,50 +1445,51 @@ class PipelineEngine:
                       f"(timesteps: {[int(timesteps[i]) for i in low_indices]})")
 
                 # ── Denoise loop (Pass 2: low-noise) ──
-                for step_idx in low_indices:
-                    if self._cancel_flag:
-                        raise InterruptedError("Generation cancelled by user")
+                with patched_sdpa(use_chunked_sdpa):
+                    for step_idx in low_indices:
+                        if self._cancel_flag:
+                            raise InterruptedError("Generation cancelled by user")
 
-                    t = timesteps[step_idx]
-                    pct = 25 + int(50 * (step_idx + 1) / num_inference_steps)
-                    gpu_gb = vram_stats().get("allocated_gb", 0)
-                    self._emit(session_id, "denoise", pct,
-                               f"Pass 2 step {step_idx+1}/{num_inference_steps} "
-                               f"(t={t:.0f}, GPU: {gpu_gb:.1f} GB)")
+                        t = timesteps[step_idx]
+                        pct = 25 + int(50 * (step_idx + 1) / num_inference_steps)
+                        gpu_gb = vram_stats().get("allocated_gb", 0)
+                        self._emit(session_id, "denoise", pct,
+                                   f"Pass 2 step {step_idx+1}/{num_inference_steps} "
+                                   f"(t={t:.0f}, GPU: {gpu_gb:.1f} GB)")
 
-                    latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
-                    timestep = t.expand(latents.shape[0])
+                        latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
+                        timestep = t.expand(latents.shape[0])
 
-                    with torch.no_grad():
-                        with current_model.cache_context("cond"):
-                            noise_pred = current_model(
-                                hidden_states=latent_model_input,
-                                timestep=timestep,
-                                encoder_hidden_states=prompt_embeds,
-                                encoder_hidden_states_image=image_embeds,
-                                return_dict=False,
-                            )[0]
-
-                        if do_cfg_2:
-                            with current_model.cache_context("uncond"):
-                                noise_uncond = current_model(
+                        with torch.no_grad():
+                            with current_model.cache_context("cond"):
+                                noise_pred = current_model(
                                     hidden_states=latent_model_input,
                                     timestep=timestep,
-                                    encoder_hidden_states=negative_prompt_embeds,
+                                    encoder_hidden_states=prompt_embeds,
                                     encoder_hidden_states_image=image_embeds,
                                     return_dict=False,
                                 )[0]
-                            noise_pred = noise_uncond + guidance_scale_2 * (
-                                noise_pred - noise_uncond)
 
-                    # Use the SAME scheduler to preserve solver state
-                    latents = main_sched.step(noise_pred, t, latents,
-                                             return_dict=False)[0]
-                    if self._slog:
-                        self._slog.log_denoise_step("denoise", 2, step_idx,
-                                                    num_inference_steps, float(t))
-                        self._slog.vram_denoise_sample("denoise", 2, step_idx,
-                                                       num_inference_steps, float(t))
+                            if do_cfg_2:
+                                with current_model.cache_context("uncond"):
+                                    noise_uncond = current_model(
+                                        hidden_states=latent_model_input,
+                                        timestep=timestep,
+                                        encoder_hidden_states=negative_prompt_embeds,
+                                        encoder_hidden_states_image=image_embeds,
+                                        return_dict=False,
+                                    )[0]
+                                noise_pred = noise_uncond + guidance_scale_2 * (
+                                    noise_pred - noise_uncond)
+
+                        # Use the SAME scheduler to preserve solver state
+                        latents = main_sched.step(noise_pred, t, latents,
+                                                 return_dict=False)[0]
+                        if self._slog:
+                            self._slog.log_denoise_step("denoise", 2, step_idx,
+                                                        num_inference_steps, float(t))
+                            self._slog.vram_denoise_sample("denoise", 2, step_idx,
+                                                           num_inference_steps, float(t))
 
                 print(f"  Pass 2 complete. VRAM: {vram_stats()}")
                 if self._slog:

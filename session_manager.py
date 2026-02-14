@@ -55,16 +55,17 @@ class SessionInfo:
     width: int = 832
     height: int = 480
     num_frames: int = 81
-    num_inference_steps: int = 8
-    guidance_scale: float = 2.0
-    guidance_scale_2: float = 2.0
+    num_inference_steps: int = 20
+    guidance_scale: float = 5.0
+    guidance_scale_2: float = 5.0
     flow_shift: float = 8.0
     seed: int = 42
     fps: int = 16
     duration: float = 5.0          # Video length in seconds
     output_fps: int = 24           # Output framerate after RIFE interpolation
     enable_upscale: bool = False
-    boundary_ratio: float = 0.5    # High/low noise boundary split
+    boundary_ratio: float = 0.618  # High/low noise boundary split
+    distill_lora_mode: bool = False # True = fast 4-step distill, False = quality mode
 
     # LoRA overrides (list of {adapter_name, scale})
     lora_scales: list = field(default_factory=list)

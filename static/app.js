@@ -105,6 +105,14 @@
     });
   }
 
+  // Helper to set both range + number input for a param
+  function setParam(id, val) {
+    const range = $(`#${id}`);
+    const num = $(`#${id}-num`);
+    if (range) range.value = val;
+    if (num) num.value = val;
+  }
+
   // Called when any parameter slider/number changes
   function onParamChange(id) {
     if (id === "duration" || id === "fps") updateFramesFromDuration();
@@ -557,7 +565,8 @@
     const durStr = s.duration ? `${s.duration}s` : "";
     const outFpsStr = s.output_fps && s.output_fps !== s.fps ? ` → ${s.output_fps}fps` : "";
     $("#info-size").textContent = `${s.width}×${s.height}, ${s.num_frames}f ${durStr} @ ${s.fps}fps${outFpsStr}`;
-    $("#info-steps").textContent = s.num_inference_steps;
+    const modeStr = s.distill_lora_mode ? "⚡ Fast" : "🎨 Quality";
+    $("#info-steps").textContent = `${s.num_inference_steps} (${modeStr})`;
     $("#info-seed").textContent = s.seed;
     $("#info-cfg").textContent = `${s.guidance_scale} / ${s.guidance_scale_2 || "—"}`;
     $("#info-status").textContent = s.status;
@@ -688,21 +697,13 @@
       const d = await r.json();
       if (d.error) { toast("Clone failed: " + d.error, "error"); return; }
 
-      // Helper to set both range + number
-      function setParam(id, val) {
-        const range = $(`#${id}`);
-        const num = $(`#${id}-num`);
-        if (range) range.value = val;
-        if (num) num.value = val;
-      }
-
       $("#prompt").value = d.prompt || "";
       $("#negative-prompt").value = d.negative_prompt || "";
       setParam("width", d.width || 832);
       setParam("height", d.height || 480);
       setParam("duration", d.duration || 5.0);
       setParam("fps", d.fps || 16);
-      setParam("steps", d.num_inference_steps || 16);
+      setParam("steps", d.num_inference_steps || 20);
       setParam("cfg", d.guidance_scale || 5.0);
       setParam("cfg2", d.guidance_scale_2 || 5.0);
       setParam("flow-shift", d.flow_shift || 8.0);
@@ -710,6 +711,9 @@
       setParam("boundary-ratio", d.boundary_ratio || 0.618);
       $("#seed").value = d.seed || 42;
       $("#enable-upscale").checked = d.enable_upscale || false;
+
+      // Restore mode toggle based on session's distill_lora_mode
+      applyMode(d.distill_lora_mode ? "fast" : "quality", /* silent */ true);
 
       updateFramesFromDuration();
       updateInterpHint();
@@ -737,6 +741,76 @@
       toast("Session parameters cloned", "success");
     } catch (e) {
       toast("Clone error: " + e.message, "error");
+    }
+  }
+
+  // ─── Mode Toggle (Quality / Fast) ──────────────────────────
+  // Quality mode: no distill LoRAs, full CFG, 20 steps
+  // Fast mode: LightX2V distill LoRAs, CFG=1.0, 4 steps, flow_shift=5.0
+  let currentMode = "quality";
+
+  // Presets store the values that were active before switching
+  const QUALITY_DEFAULTS = { steps: 20, cfg: 5.0, cfg2: 5.0, flowShift: 8.0, boundaryRatio: 0.618 };
+  const FAST_DEFAULTS    = { steps: 4,  cfg: 1.0, cfg2: 1.0, flowShift: 5.0, boundaryRatio: 0.618 };
+
+  function setupModeToggle() {
+    const qualBtn = $("#mode-quality");
+    const fastBtn = $("#mode-fast");
+    if (!qualBtn || !fastBtn) return;
+
+    qualBtn.addEventListener("click", () => applyMode("quality"));
+    fastBtn.addEventListener("click", () => applyMode("fast"));
+
+    // Initial state: quality mode, disable distill LoRA cards
+    applyMode("quality", /* silent */ true);
+  }
+
+  function applyMode(mode, silent) {
+    currentMode = mode;
+    const qualBtn = $("#mode-quality");
+    const fastBtn = $("#mode-fast");
+    const hint = $("#mode-hint");
+
+    // Toggle active buttons
+    if (qualBtn) qualBtn.classList.toggle("active", mode === "quality");
+    if (fastBtn) fastBtn.classList.toggle("active", mode === "fast");
+
+    // Update hint text
+    if (hint) {
+      if (mode === "quality") {
+        hint.textContent = "Quality mode: 20 steps, CFG=5.0, quality LoRAs only";
+      } else {
+        hint.textContent = "Fast mode: 4 steps, no CFG (baked in), LightX2V distill — ~10× faster";
+      }
+    }
+
+    // Apply preset values
+    const preset = mode === "fast" ? FAST_DEFAULTS : QUALITY_DEFAULTS;
+    setParam("steps", preset.steps);
+    setParam("cfg", preset.cfg);
+    setParam("cfg2", preset.cfg2);
+    setParam("flow-shift", preset.flowShift);
+    setParam("boundary-ratio", preset.boundaryRatio);
+
+    // Enable/disable distill LoRA cards
+    $$(".lora-card").forEach(card => {
+      if (card.dataset.role === "distill") {
+        if (mode === "quality") {
+          card.classList.add("lora-disabled");
+        } else {
+          card.classList.remove("lora-disabled");
+        }
+      }
+    });
+
+    // Update computed displays
+    updateTotalSteps();
+
+    if (!silent) {
+      toast(mode === "quality"
+        ? "🎨 Quality mode — distill LoRAs disabled, full CFG"
+        : "⚡ Fast mode — LightX2V distill, CFG=1.0, 4 steps",
+        "info", 3000);
     }
   }
 
@@ -768,6 +842,7 @@
       seed:                parseInt($("#seed").value),
       enable_upscale:      $("#enable-upscale").checked,
       lora_scales:         loraScales,
+      distill_lora_mode:   currentMode === "fast",
       // Memory settings
       offload_type:        $("#offload-type") ? $("#offload-type").value : "block_level",
       num_blocks_per_group: parseInt($("#num-blocks-per-group")?.value) || 1,
@@ -933,6 +1008,7 @@
     connectSSE();
     setupDropZone();
     setupHybridInputs();
+    setupModeToggle();
     setupKeyboardShortcuts();
     setupVideoTabs();
     setupSessionLogTabs();

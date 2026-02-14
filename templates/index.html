@@ -63,6 +63,19 @@
           </div>
         </div>
 
+        <!-- ─── Generation Mode ──────────────────────────── -->
+        <div class="mode-toggle-section">
+          <div class="mode-toggle">
+            <button id="mode-quality" class="mode-btn active" data-mode="quality" title="Full CFG, 20 steps, quality LoRAs only — best results">
+              🎨 Quality
+            </button>
+            <button id="mode-fast" class="mode-btn" data-mode="fast" title="LightX2V distill, 4 steps, no CFG — 10× faster">
+              ⚡ Fast (Distill)
+            </button>
+          </div>
+          <div id="mode-hint" class="mode-hint">Quality mode: 20 steps, CFG=5.0, quality LoRAs only</div>
+        </div>
+
         <!-- ─── Generation Settings ────────────────────────── -->
         <details class="config-section" open>
           <summary>⚙️ Generation Settings</summary>
@@ -125,8 +138,8 @@
               <div class="param-item">
                 <label for="steps">Steps (total)</label>
                 <div class="hybrid-input">
-                  <input type="range" id="steps" value="{{ config.get('num_inference_steps', 16) }}" min="1" max="50" step="1" />
-                  <input type="number" id="steps-num" value="{{ config.get('num_inference_steps', 16) }}" min="1" max="50" step="1" class="param-number" />
+                  <input type="range" id="steps" value="{{ config.get('num_inference_steps', 20) }}" min="1" max="50" step="1" />
+                  <input type="number" id="steps-num" value="{{ config.get('num_inference_steps', 20) }}" min="1" max="50" step="1" class="param-number" />
                 </div>
                 <div class="computed-hint">Split across high↔low by boundary ratio</div>
               </div>
@@ -243,12 +256,15 @@
           <summary>🔧 LoRA Weights <span class="lora-count">({{ loras | length }})</span></summary>
           <div id="lora-grid" class="lora-grid">
             {% for lora in loras %}
-            <div class="lora-card" data-index="{{ loop.index0 }}">
+            <div class="lora-card{% if lora.get('role','quality') == 'distill' %} lora-distill{% endif %}" data-index="{{ loop.index0 }}" data-role="{{ lora.get('role', 'quality') }}">
               <div class="lora-top">
                 <span class="lora-name" title="{{ lora.adapter_name }}">{{ lora.adapter_name }}</span>
                 <span class="lora-badge {% if lora.get('target','transformer') == 'transformer_2' %}badge-low{% else %}badge-high{% endif %}">
                   {{ 'HIGH' if lora.get('target','transformer') == 'transformer' else 'LOW' }}
                 </span>
+                {% if lora.get('role') == 'distill' %}
+                <span class="lora-badge badge-distill" title="Distill LoRA — only active in Fast mode">⚡</span>
+                {% endif %}
               </div>
               <div class="lora-control">
                 <input type="range" class="lora-scale" data-lora="{{ loop.index0 }}"
