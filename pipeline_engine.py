@@ -1005,17 +1005,19 @@ class PipelineEngine:
             offload_type = cfg.get("offload_type", "block_level")
             use_offload = cfg.get("enable_group_offload", True)
             force_vae_cpu = cfg.get("force_vae_cpu", False)
-            flow_shift = cfg.get("flow_shift", 8.0)
 
             # ── Distill LoRA mode detection ──
             # When distill_lora_mode=True, LightX2V CFG-distilled LoRAs are used.
             # This REQUIRES: CFG=1.0 (guidance baked into weights),
             # 4 steps (what the model was trained on), flow_shift=5.0.
+            #
+            # When distill_lora_mode=False (QUALITY mode), we enforce minimum
+            # sane defaults so users can't accidentally run quality mode with
+            # distill-level parameters (CFG=1.0 + 4 steps → bland, textureless).
             distill_lora_mode = getattr(info, "distill_lora_mode", False)
             if distill_lora_mode:
                 print("  ⚡ DISTILL MODE: LightX2V enabled — "
                       "forcing CFG=1.0, 4 steps, flow_shift=5.0")
-                # Force the correct parameters for distilled inference
                 info.guidance_scale = 1.0
                 info.guidance_scale_2 = 1.0
                 info.num_inference_steps = 4
@@ -1026,10 +1028,35 @@ class PipelineEngine:
                     self._slog.log("denoise", "  → Steps forced to 4 (distill training schedule)")
                     self._slog.log("denoise", "  → flow_shift forced to 5.0 (LightX2V recommendation)")
             else:
-                print("  🎨 QUALITY MODE: distill LoRAs disabled, "
-                      "using full CFG + standard steps")
+                # QUALITY MODE — enforce sane minimums.
+                # Without CFG > 1.0, the model has no guidance → flat/bland output.
+                # Without enough steps, the solver can't converge → mushy detail.
+                flow_shift = getattr(info, "flow_shift", None) or cfg.get("flow_shift", 8.0)
+                enforced = []
+                if info.guidance_scale < 2.0:
+                    info.guidance_scale = cfg.get("guidance_scale", 5.0)
+                    enforced.append(f"CFG_high→{info.guidance_scale}")
+                if info.guidance_scale_2 < 2.0:
+                    info.guidance_scale_2 = cfg.get("guidance_scale_2", 5.0)
+                    enforced.append(f"CFG_low→{info.guidance_scale_2}")
+                if info.num_inference_steps < 8:
+                    info.num_inference_steps = cfg.get("num_inference_steps", 20)
+                    enforced.append(f"steps→{info.num_inference_steps}")
+                if flow_shift < 6.0:
+                    flow_shift = cfg.get("flow_shift", 8.0)
+                    enforced.append(f"flow_shift→{flow_shift}")
+
+                if enforced:
+                    print(f"  🎨 QUALITY MODE: enforced sane defaults: {', '.join(enforced)}")
+                else:
+                    print("  🎨 QUALITY MODE: user parameters look good")
+
                 if self._slog:
                     self._slog.log("denoise", "🎨 QUALITY MODE — distill LoRAs will be skipped")
+                    if enforced:
+                        self._slog.log("denoise", f"  → Enforced minimums: {', '.join(enforced)}")
+                    self._slog.log("denoise", f"  CFG={info.guidance_scale}/{info.guidance_scale_2}, "
+                                   f"steps={info.num_inference_steps}, flow_shift={flow_shift}")
 
             # ── Chunked SDPA resolution ──
             use_chunked_sdpa = _resolve_chunked_attention(cfg)
@@ -1208,10 +1235,10 @@ class PipelineEngine:
             # boundary_ratio controls where the high→low split happens
             # boundary_timestep = boundary_ratio × num_train_timesteps
             # (this is how the reference WanImageToVideoPipeline does it)
-            boundary_ratio = cfg.get("boundary_ratio", 0.618)
+            boundary_ratio = cfg.get("boundary_ratio", 0.9)
             if hasattr(info, "boundary_ratio") and info.boundary_ratio is not None:
                 boundary_ratio = info.boundary_ratio
-            boundary_ratio = max(0.1, min(0.9, float(boundary_ratio)))
+            boundary_ratio = max(0.1, min(0.95, float(boundary_ratio)))
 
             # Single scheduler for the entire loop — preserves UniPC solver state
             main_sched = UniPCMultistepScheduler.from_config(

@@ -140,9 +140,14 @@ seed: 42                    # -1 for random
 #   boundary_timestep = boundary_ratio × num_train_timesteps (1000)
 #   timesteps >= boundary → high-noise transformer
 #   timesteps < boundary  → low-noise transformer
-# With flow_shift=8.0 and 16 steps, ratio=0.618 gives ~14 high + 2 low steps
-# Higher ratio → more steps go to high-noise, fewer to low-noise
-boundary_ratio: 0.618
+#
+# The OFFICIAL Wan2.2-I2V-A14B model_index.json ships boundary_ratio=0.9.
+# This means ~90% of steps go to the high-noise transformer, with only
+# the final ~10% handled by low-noise. The high-noise transformer does
+# the heavy compositional lifting; low-noise refines.
+#
+# Higher ratio → more steps go to high-noise, fewer to low-noise.
+boundary_ratio: 0.9
 
 # ─── Memory management ─────────────────────────────────────────────
 # group_offload: moves transformer blocks CPU↔GPU on-the-fly

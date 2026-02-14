@@ -708,7 +708,7 @@
       setParam("cfg2", d.guidance_scale_2 || 5.0);
       setParam("flow-shift", d.flow_shift || 8.0);
       setParam("output-fps", d.output_fps || 24);
-      setParam("boundary-ratio", d.boundary_ratio || 0.618);
+      setParam("boundary-ratio", d.boundary_ratio || 0.9);
       $("#seed").value = d.seed || 42;
       $("#enable-upscale").checked = d.enable_upscale || false;
 
@@ -750,8 +750,8 @@
   let currentMode = "quality";
 
   // Presets store the values that were active before switching
-  const QUALITY_DEFAULTS = { steps: 20, cfg: 5.0, cfg2: 5.0, flowShift: 8.0, boundaryRatio: 0.618 };
-  const FAST_DEFAULTS    = { steps: 4,  cfg: 1.0, cfg2: 1.0, flowShift: 5.0, boundaryRatio: 0.618 };
+  const QUALITY_DEFAULTS = { steps: 20, cfg: 5.0, cfg2: 5.0, flowShift: 8.0, boundaryRatio: 0.9 };
+  const FAST_DEFAULTS    = { steps: 4,  cfg: 1.0, cfg2: 1.0, flowShift: 5.0, boundaryRatio: 0.9 };
 
   function setupModeToggle() {
     const qualBtn = $("#mode-quality");

@@ -64,7 +64,7 @@ class SessionInfo:
     duration: float = 5.0          # Video length in seconds
     output_fps: int = 24           # Output framerate after RIFE interpolation
     enable_upscale: bool = False
-    boundary_ratio: float = 0.618  # High/low noise boundary split
+    boundary_ratio: float = 0.9    # High/low noise boundary split (official model default)
     distill_lora_mode: bool = False # True = fast 4-step distill, False = quality mode
 
     # LoRA overrides (list of {adapter_name, scale})
@@ -135,7 +135,7 @@ class SessionManager:
             duration=float(params.get("duration", 5.0)),
             output_fps=int(params.get("output_fps", 24)),
             enable_upscale=bool(params.get("enable_upscale", False)),
-            boundary_ratio=float(params.get("boundary_ratio", 0.5)),
+            boundary_ratio=float(params.get("boundary_ratio", 0.9)),
             lora_scales=params.get("lora_scales", []),
             distill_lora_mode=bool(params.get("distill_lora_mode", False)),
         )

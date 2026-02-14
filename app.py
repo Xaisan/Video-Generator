@@ -228,7 +228,7 @@ def api_generate():
             "output_fps": int(data.get("output_fps", config.get("output_fps", 24))),
             "enable_upscale": data.get("enable_upscale", False),
             "lora_scales": data.get("lora_scales", []),
-            "boundary_ratio": float(data.get("boundary_ratio", config.get("boundary_ratio", 0.618))),
+            "boundary_ratio": float(data.get("boundary_ratio", config.get("boundary_ratio", 0.9))),
             "distill_lora_mode": bool(data.get("distill_lora_mode", config.get("distill_lora_mode", False))),
         }
 
