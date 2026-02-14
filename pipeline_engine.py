@@ -107,8 +107,15 @@ def snap_to_mod(value: int, mod: int = 16) -> int:
 
 # ─── Component loaders (load on demand, free after use) ────────────
 
-def load_text_encoder(cfg: dict):
-    """Load text encoder + tokenizer from HuggingFace."""
+def load_text_encoder(cfg: dict, device_strategy: str = "auto"):
+    """Load text encoder + tokenizer with smart device placement.
+
+    device_strategy:
+        "auto" — use accelerate device_map to split model across GPU + CPU,
+                 putting as many layers on GPU as VRAM allows.
+        "cpu"  — entire model on CPU (safest, slightly slower).
+        "gpu"  — entire model on GPU (requires >12 GB free VRAM).
+    """
     from transformers import AutoTokenizer, UMT5EncoderModel
 
     model_id = cfg["model_id"]
@@ -119,10 +126,47 @@ def load_text_encoder(cfg: dict):
     print(f"  Loading tokenizer from {model_id}")
     tokenizer = AutoTokenizer.from_pretrained(model_id, subfolder="tokenizer")
 
-    print(f"  Loading text encoder from {model_id}")
-    text_encoder = UMT5EncoderModel.from_pretrained(
-        model_id, subfolder="text_encoder", torch_dtype=dtype,
-    )
+    print(f"  Loading text encoder from {model_id} (strategy={device_strategy})")
+
+    if device_strategy == "auto" and torch.cuda.is_available():
+        # ── Smart split: measure free VRAM, give GPU as much as fits ──
+        headroom_gb = cfg.get("text_encoder_gpu_headroom_gb", 1.5)
+        total_vram = torch.cuda.get_device_properties(0).total_memory
+        used = max(torch.cuda.memory_allocated(), torch.cuda.memory_reserved())
+        free_gb = (total_vram - used) / 1024**3
+        usable_gb = max(0.5, free_gb - headroom_gb)
+
+        max_memory = {0: f"{usable_gb:.1f}GiB", "cpu": "64GiB"}
+        print(f"  Smart split: {free_gb:.2f} GiB free VRAM, "
+              f"budget {usable_gb:.1f} GiB for encoder "
+              f"(headroom={headroom_gb} GiB)")
+
+        try:
+            text_encoder = UMT5EncoderModel.from_pretrained(
+                model_id, subfolder="text_encoder", torch_dtype=dtype,
+                device_map="auto",
+                max_memory=max_memory,
+            )
+            # Report how layers were placed
+            if hasattr(text_encoder, "hf_device_map"):
+                dm = text_encoder.hf_device_map
+                on_gpu = sum(1 for v in dm.values() if str(v) == "0")
+                on_cpu = sum(1 for v in dm.values() if str(v) == "cpu")
+                print(f"  Device split: {on_gpu}/{len(dm)} modules on GPU, "
+                      f"{on_cpu}/{len(dm)} on CPU")
+        except Exception as e:
+            print(f"  *** device_map='auto' failed ({e}), "
+                  f"falling back to full CPU", flush=True)
+            text_encoder = UMT5EncoderModel.from_pretrained(
+                model_id, subfolder="text_encoder", torch_dtype=dtype,
+            )
+            text_encoder.to("cpu")
+    else:
+        # "cpu" or "gpu" — plain load, caller moves to device
+        text_encoder = UMT5EncoderModel.from_pretrained(
+            model_id, subfolder="text_encoder", torch_dtype=dtype,
+        )
+
     return tokenizer, text_encoder
 
 
@@ -622,12 +666,38 @@ class PipelineEngine:
             force_fp16 = amd.get("force_fp16", False)
             dtype = torch.float16 if force_fp16 else torch.bfloat16
 
+            # Determine device strategy (backward compat: force_text_encoder_cpu)
+            if cfg.get("force_text_encoder_cpu", False):
+                device_strategy = "cpu"
+            else:
+                device_strategy = cfg.get("text_encoder_device", "auto")
+
             self._emit(session_id, "encode", 10, "Loading tokenizer + text encoder…")
-            self._slog.log("encode", f"Loading tokenizer + text encoder (dtype={dtype})")
+            self._slog.log("encode", f"Loading tokenizer + text encoder (dtype={dtype}, strategy={device_strategy})")
             self._slog.vram_event("encode", "before text_encoder load")
-            tokenizer, text_encoder = load_text_encoder(cfg)
-            text_encoder.to("cuda")
-            self._slog.vram_event("encode", "text_encoder on GPU")
+            tokenizer, text_encoder = load_text_encoder(cfg, device_strategy)
+
+            # For non-auto strategies, move model to target device
+            if device_strategy == "gpu":
+                try:
+                    text_encoder.to("cuda")
+                except torch.cuda.OutOfMemoryError:
+                    print("  *** GPU OOM — retrying with auto split", flush=True)
+                    self._slog.log("encode", "GPU OOM, retrying with device_map='auto'")
+                    del text_encoder
+                    flush_vram()
+                    tokenizer, text_encoder = load_text_encoder(cfg, "auto")
+            elif device_strategy == "cpu":
+                text_encoder.to("cpu")
+            # "auto" — already placed across devices by device_map
+
+            # Input tensors go to the device of the first parameter
+            # (accelerate hooks handle cross-device routing during forward)
+            encode_device = next(text_encoder.parameters()).device
+            is_split = hasattr(text_encoder, "hf_device_map")
+            self._slog.vram_event("encode", f"text_encoder ready (input_device={encode_device}, split={is_split})")
+            if is_split:
+                self._slog.log("encode", f"Device map: {text_encoder.hf_device_map}")
 
             self._emit(session_id, "encode", 30, "Encoding prompt…")
             self._slog.log("encode", "Tokenizing prompt…")
@@ -642,10 +712,10 @@ class PipelineEngine:
 
             with torch.no_grad():
                 prompt_embeds = text_encoder(
-                    prompt_ids.input_ids.to("cuda")
+                    prompt_ids.input_ids.to(encode_device)
                 ).last_hidden_state
                 neg_embeds = text_encoder(
-                    neg_ids.input_ids.to("cuda")
+                    neg_ids.input_ids.to(encode_device)
                 ).last_hidden_state
 
             self._slog.log_tensor("encode", "prompt_embeds", prompt_embeds)

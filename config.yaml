@@ -114,6 +114,18 @@ offload_type: "block_level"  # "block_level" (fewer PCIe transfers, better GPU u
 num_blocks_per_group: 1      # For block_level: how many transformer blocks per group (1=minimal VRAM, higher=faster)
 use_stream: false            # MUST be false for AMD/HIP (CUDA streams broken on ROCm)
 
+# ─── Text encoder settings ─────────────────────────────────────────
+# Device strategy for the ~12 GB UMT5 text encoder:
+#   "auto" — smart split: measures free VRAM and places as many encoder
+#            layers on GPU as fit, spilling the rest to CPU.  Best of
+#            both worlds — max GPU speed, no OOM.
+#   "cpu"  — entire encoder on CPU (safe fallback, ~10s slower).
+#   "gpu"  — entire encoder on GPU (needs >12 GB free VRAM).
+text_encoder_device: "auto"
+# VRAM headroom (GiB) kept free when using "auto" strategy.
+# Lower = more layers on GPU (faster) but riskier.  1.0-2.0 is safe.
+text_encoder_gpu_headroom_gb: 1.0
+
 # ─── VAE settings ──────────────────────────────────────────────────
 # VAE must stay float32 for quality; we tile it to fit in VRAM
 vae_tiling: true
