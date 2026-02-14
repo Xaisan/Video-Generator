@@ -50,7 +50,7 @@
             </div>
           </div>
 
-          <!-- Right column: Parameters -->
+          <!-- Right column: Prompts -->
           <div class="form-col">
             <div class="form-group">
               <label for="prompt">Prompt</label>
@@ -60,84 +60,203 @@
               <label for="negative-prompt">Negative Prompt</label>
               <textarea id="negative-prompt" rows="2" placeholder="Things to avoid...">{{ config.get('negative_prompt', '') }}</textarea>
             </div>
-
-            <div class="form-row">
-              <div class="form-group slider-group">
-                <label for="width">Width <span class="slider-value" id="width-val">{{ config.get('width', 832) }}</span></label>
-                <input type="range" id="width" value="{{ config.get('width', 832) }}" min="256" max="1920" step="16" />
-              </div>
-              <div class="form-group slider-group">
-                <label for="height">Height <span class="slider-value" id="height-val">{{ config.get('height', 480) }}</span></label>
-                <input type="range" id="height" value="{{ config.get('height', 480) }}" min="256" max="1080" step="16" />
-              </div>
-            </div>
-
-            <div class="form-row">
-              <div class="form-group slider-group">
-                <label for="duration">Duration (s) <span class="slider-value" id="duration-val">{{ config.get('duration', 5.0) }}</span></label>
-                <input type="range" id="duration" value="{{ config.get('duration', 5.0) }}" min="1" max="20" step="0.5" />
-              </div>
-              <div class="form-group slider-group">
-                <label for="fps">Generation FPS <span class="slider-value" id="fps-val">{{ config.get('fps', 16) }}</span></label>
-                <input type="range" id="fps" value="{{ config.get('fps', 16) }}" min="8" max="30" step="1" />
-              </div>
-              <div class="form-group">
-                <label>Frames <span class="slider-value computed-value" id="frames-computed">81</span></label>
-                <div class="computed-hint">auto: duration × fps → 4k+1</div>
-              </div>
-            </div>
-
-            <div class="form-row">
-              <div class="form-group slider-group">
-                <label for="steps">Steps <span class="slider-value" id="steps-val">{{ config.get('num_inference_steps', 8) }}</span></label>
-                <input type="range" id="steps" value="{{ config.get('num_inference_steps', 8) }}" min="1" max="50" step="1" />
-              </div>
-              <div class="form-group slider-group">
-                <label for="cfg">CFG Scale <span class="slider-value" id="cfg-val">{{ config.get('guidance_scale', 2.0) }}</span></label>
-                <input type="range" id="cfg" value="{{ config.get('guidance_scale', 2.0) }}" min="1" max="20" step="0.1" />
-              </div>
-              <div class="form-group slider-group">
-                <label for="cfg2">CFG Scale 2 <span class="slider-value" id="cfg2-val">{{ config.get('guidance_scale_2', 2.0) }}</span></label>
-                <input type="range" id="cfg2" value="{{ config.get('guidance_scale_2', 2.0) }}" min="1" max="20" step="0.1" />
-              </div>
-              <div class="form-group slider-group">
-                <label for="flow-shift">Flow Shift <span class="slider-value" id="flow-shift-val">{{ config.get('flow_shift', 8.0) }}</span></label>
-                <input type="range" id="flow-shift" value="{{ config.get('flow_shift', 8.0) }}" min="0" max="30" step="0.5" />
-              </div>
-            </div>
-
-            <div class="form-row">
-              <div class="form-group">
-                <label for="seed">Seed</label>
-                <div class="seed-row">
-                  <input type="number" id="seed" value="{{ config.get('seed', 42) }}" min="-1" max="999999999" />
-                  <button class="btn btn-xs btn-ghost" onclick="document.getElementById('seed').value=Math.floor(Math.random()*999999999)" title="Randomize seed">🎲</button>
-                </div>
-              </div>
-              <div class="form-group slider-group">
-                <label for="output-fps">Output FPS <span class="slider-value" id="output-fps-val">{{ config.get('output_fps', 24) }}</span></label>
-                <input type="range" id="output-fps" value="{{ config.get('output_fps', 24) }}" min="8" max="60" step="1" />
-                <div class="computed-hint" id="interp-hint">RIFE: 16→24fps</div>
-              </div>
-              <div class="form-group chk">
-                <label>
-                  <input type="checkbox" id="enable-upscale" />
-                  Enable 4× Upscale
-                </label>
-              </div>
-            </div>
           </div>
         </div>
 
-        <!-- LoRA scales -->
-        <details class="lora-section" open>
-          <summary>LoRA Weights</summary>
-          <div id="lora-scales">
+        <!-- ─── Generation Settings ────────────────────────── -->
+        <details class="config-section" open>
+          <summary>⚙️ Generation Settings</summary>
+          <div class="config-body">
+
+            <!-- Resolution row -->
+            <div class="param-row">
+              <div class="param-item">
+                <label for="width">Width</label>
+                <div class="hybrid-input">
+                  <input type="range" id="width" value="{{ config.get('width', 832) }}" min="256" max="1920" step="16" />
+                  <input type="number" id="width-num" value="{{ config.get('width', 832) }}" min="256" max="1920" step="16" class="param-number" />
+                </div>
+              </div>
+              <div class="param-item">
+                <label for="height">Height</label>
+                <div class="hybrid-input">
+                  <input type="range" id="height" value="{{ config.get('height', 480) }}" min="256" max="1080" step="16" />
+                  <input type="number" id="height-num" value="{{ config.get('height', 480) }}" min="256" max="1080" step="16" class="param-number" />
+                </div>
+              </div>
+              <div class="param-item param-item-compact">
+                <label>MP</label>
+                <span class="computed-badge" id="mpx-computed">0.40</span>
+              </div>
+            </div>
+
+            <!-- Timing row -->
+            <div class="param-row">
+              <div class="param-item">
+                <label for="duration">Duration (s)</label>
+                <div class="hybrid-input">
+                  <input type="range" id="duration" value="{{ config.get('duration', 5.0) }}" min="1" max="20" step="0.5" />
+                  <input type="number" id="duration-num" value="{{ config.get('duration', 5.0) }}" min="1" max="20" step="0.5" class="param-number" />
+                </div>
+              </div>
+              <div class="param-item">
+                <label for="fps">Gen FPS</label>
+                <div class="hybrid-input">
+                  <input type="range" id="fps" value="{{ config.get('fps', 16) }}" min="8" max="30" step="1" />
+                  <input type="number" id="fps-num" value="{{ config.get('fps', 16) }}" min="8" max="30" step="1" class="param-number" />
+                </div>
+              </div>
+              <div class="param-item">
+                <label for="output-fps">Output FPS</label>
+                <div class="hybrid-input">
+                  <input type="range" id="output-fps" value="{{ config.get('output_fps', 24) }}" min="8" max="60" step="1" />
+                  <input type="number" id="output-fps-num" value="{{ config.get('output_fps', 24) }}" min="8" max="60" step="1" class="param-number" />
+                </div>
+              </div>
+              <div class="param-item param-item-compact">
+                <label>Frames</label>
+                <span class="computed-badge" id="frames-computed">81</span>
+                <div class="computed-hint" id="interp-hint">RIFE: 16→24</div>
+              </div>
+            </div>
+
+            <!-- Sampler row -->
+            <div class="param-row">
+              <div class="param-item">
+                <label for="steps">Steps / pass</label>
+                <div class="hybrid-input">
+                  <input type="range" id="steps" value="{{ config.get('num_inference_steps', 8) }}" min="1" max="50" step="1" />
+                  <input type="number" id="steps-num" value="{{ config.get('num_inference_steps', 8) }}" min="1" max="50" step="1" class="param-number" />
+                </div>
+                <div class="computed-hint">Total: <span id="total-steps">16</span> (2 passes)</div>
+              </div>
+              <div class="param-item">
+                <label for="cfg">CFG High</label>
+                <div class="hybrid-input">
+                  <input type="range" id="cfg" value="{{ config.get('guidance_scale', 2.0) }}" min="1" max="20" step="0.05" />
+                  <input type="number" id="cfg-num" value="{{ config.get('guidance_scale', 2.0) }}" min="1" max="20" step="0.05" class="param-number" />
+                </div>
+              </div>
+              <div class="param-item">
+                <label for="cfg2">CFG Low</label>
+                <div class="hybrid-input">
+                  <input type="range" id="cfg2" value="{{ config.get('guidance_scale_2', 2.0) }}" min="1" max="20" step="0.05" />
+                  <input type="number" id="cfg2-num" value="{{ config.get('guidance_scale_2', 2.0) }}" min="1" max="20" step="0.05" class="param-number" />
+                </div>
+              </div>
+            </div>
+
+            <!-- Flow / Boundary row -->
+            <div class="param-row">
+              <div class="param-item">
+                <label for="flow-shift">Flow Shift</label>
+                <div class="hybrid-input">
+                  <input type="range" id="flow-shift" value="{{ config.get('flow_shift', 8.0) }}" min="0" max="30" step="0.1" />
+                  <input type="number" id="flow-shift-num" value="{{ config.get('flow_shift', 8.0) }}" min="0" max="30" step="0.1" class="param-number" />
+                </div>
+                <div class="computed-hint">I2V=8, T2V-720p=5, T2V-480p=3</div>
+              </div>
+              <div class="param-item">
+                <label for="boundary-ratio">Boundary Ratio</label>
+                <div class="hybrid-input">
+                  <input type="range" id="boundary-ratio" value="{{ config.get('boundary_ratio', 0.5) }}" min="0.1" max="0.9" step="0.01" />
+                  <input type="number" id="boundary-ratio-num" value="{{ config.get('boundary_ratio', 0.5) }}" min="0.1" max="0.9" step="0.01" class="param-number" />
+                </div>
+                <div class="computed-hint">High↔Low noise split point</div>
+              </div>
+              <div class="param-item">
+                <label for="seed">Seed</label>
+                <div class="seed-row">
+                  <input type="number" id="seed" value="{{ config.get('seed', 42) }}" min="-1" max="999999999" class="param-number param-number-wide" />
+                  <button class="btn btn-xs btn-ghost" onclick="document.getElementById('seed').value=Math.floor(Math.random()*999999999)" title="Random">🎲</button>
+                  <button class="btn btn-xs btn-ghost" onclick="document.getElementById('seed').value=-1" title="Auto-random (-1)">∞</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Upscale row -->
+            <div class="param-row">
+              <div class="param-item">
+                <label class="chk-label">
+                  <input type="checkbox" id="enable-upscale" {% if config.get('enable_upscale', false) %}checked{% endif %} />
+                  Enable 4× Upscale + RIFE
+                </label>
+              </div>
+            </div>
+
+          </div>
+        </details>
+
+        <!-- ─── Memory / Performance ───────────────────────── -->
+        <details class="config-section">
+          <summary>🧠 Memory & Performance</summary>
+          <div class="config-body">
+            <div class="param-row">
+              <div class="param-item">
+                <label for="offload-type">Offload Type</label>
+                <select id="offload-type" class="param-select">
+                  <option value="block_level" {% if config.get('offload_type', 'block_level') == 'block_level' %}selected{% endif %}>Block Level (faster)</option>
+                  <option value="leaf_level" {% if config.get('offload_type') == 'leaf_level' %}selected{% endif %}>Leaf Level (less VRAM)</option>
+                </select>
+              </div>
+              <div class="param-item">
+                <label for="num-blocks-per-group">Blocks / Group</label>
+                <div class="hybrid-input">
+                  <input type="range" id="num-blocks-per-group" value="{{ config.get('num_blocks_per_group', 1) }}" min="1" max="10" step="1" />
+                  <input type="number" id="num-blocks-per-group-num" value="{{ config.get('num_blocks_per_group', 1) }}" min="1" max="10" step="1" class="param-number" />
+                </div>
+                <div class="computed-hint">1=min VRAM (~10GB), higher=faster</div>
+              </div>
+              <div class="param-item">
+                <label class="chk-label">
+                  <input type="checkbox" id="enable-group-offload" {% if config.get('enable_group_offload', true) %}checked{% endif %} />
+                  Group Offloading
+                </label>
+              </div>
+            </div>
+            <div class="param-row">
+              <div class="param-item">
+                <label class="chk-label">
+                  <input type="checkbox" id="vae-tiling" {% if config.get('vae_tiling', true) %}checked{% endif %} />
+                  VAE Tiling
+                </label>
+              </div>
+              <div class="param-item">
+                <label class="chk-label">
+                  <input type="checkbox" id="vae-slicing" {% if config.get('vae_slicing', true) %}checked{% endif %} />
+                  VAE Slicing
+                </label>
+              </div>
+              <div class="param-item">
+                <label class="chk-label">
+                  <input type="checkbox" id="force-vae-cpu" {% if config.get('force_vae_cpu', false) %}checked{% endif %} />
+                  Force VAE on CPU
+                </label>
+                <div class="computed-hint">Slower but avoids GPU OOM</div>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <!-- ─── LoRA Weights ───────────────────────────────── -->
+        <details class="config-section" open>
+          <summary>🔧 LoRA Weights <span class="lora-count">({{ loras | length }})</span></summary>
+          <div id="lora-grid" class="lora-grid">
             {% for lora in loras %}
-            <div class="form-group lora-item slider-group">
-              <label title="{{ lora.path }}">{{ lora.path | basename }} <span class="slider-value lora-val">{{ lora.scale }}</span></label>
-              <input type="range" class="lora-scale" data-lora="{{ loop.index0 }}"
-                     value="{{ lora.scale }}" min="0" max="3" step="0.1" />
+            <div class="lora-card" data-index="{{ loop.index0 }}">
+              <div class="lora-top">
+                <span class="lora-name" title="{{ lora.adapter_name }}">{{ lora.adapter_name }}</span>
+                <span class="lora-badge {% if lora.get('target','transformer') == 'transformer_2' %}badge-low{% else %}badge-high{% endif %}">
+                  {{ 'HIGH' if lora.get('target','transformer') == 'transformer' else 'LOW' }}
+                </span>
+              </div>
+              <div class="lora-control">
+                <input type="range" class="lora-scale" data-lora="{{ loop.index0 }}"
+                       value="{{ lora.scale }}" min="0" max="5" step="0.05" />
+                <input type="number" class="lora-scale-num" data-lora="{{ loop.index0 }}"
+                       value="{{ lora.scale }}" min="0" max="5" step="0.05" />
+              </div>
+              <div class="lora-file" title="{{ lora.path }}">{{ lora.path | basename }}</div>
             </div>
             {% endfor %}
           </div>
@@ -230,7 +349,6 @@
             <button class="video-tab" data-tab="compare" id="tab-compare" style="display:none">Compare</button>
           </div>
 
-          <!-- Original video -->
           <div class="video-tab-content active" data-tab="original">
             <video id="video-player" controls loop muted></video>
             <div class="video-actions">
@@ -238,7 +356,6 @@
             </div>
           </div>
 
-          <!-- Upscaled video -->
           <div class="video-tab-content" data-tab="upscaled">
             <video id="video-player-upscaled" controls loop muted></video>
             <div class="video-actions">
@@ -246,7 +363,6 @@
             </div>
           </div>
 
-          <!-- Side-by-side comparison -->
           <div class="video-tab-content" data-tab="compare">
             <div class="video-compare">
               <div class="video-compare-col">
@@ -266,6 +382,25 @@
           <summary>📜 Pipeline Logs</summary>
           <div id="log-content" class="log-content"></div>
         </details>
+
+        <!-- Session Log Files (generation.log + vram.log) -->
+        <div id="session-logs-section" class="session-logs-section" style="display:none">
+          <div class="session-log-tabs">
+            <button class="session-log-tab active" data-logtab="generation">📋 Generation Log</button>
+            <button class="session-log-tab" data-logtab="vram">📊 VRAM Log</button>
+            <div class="session-log-actions">
+              <button id="btn-refresh-logs" class="btn btn-xs btn-ghost" title="Refresh logs">🔄</button>
+              <a id="btn-dl-gen-log" href="#" class="btn btn-xs btn-ghost" download title="Download generation.log">⬇ Gen</a>
+              <a id="btn-dl-vram-log" href="#" class="btn btn-xs btn-ghost" download title="Download vram.log">⬇ VRAM</a>
+            </div>
+          </div>
+          <div class="session-log-content active" data-logtab="generation">
+            <pre id="gen-log-content" class="session-log-pre">Loading…</pre>
+          </div>
+          <div class="session-log-content" data-logtab="vram">
+            <pre id="vram-log-content" class="session-log-pre">Loading…</pre>
+          </div>
+        </div>
       </section>
     </main>
   </div>

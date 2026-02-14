@@ -210,10 +210,15 @@ def load_scheduler(cfg: dict):
 
 # ─── LoRA loading (per-transformer) ───────────────────────────────
 def apply_loras_to_transformer(pipe, cfg: dict, target: str,
-                               lora_overrides: list | None = None):
+                               lora_overrides: list | None = None,
+                               load_as_primary: bool = False):
     """Load LoRAs for a SINGLE transformer target.
 
-    target: "transformer" or "transformer_2"
+    target: "transformer" or "transformer_2" — used to FILTER config entries.
+    load_as_primary: if True, load into pipe.transformer even when target is
+                     "transformer_2".  Needed when the low-noise transformer
+                     is mounted as pipe.transformer (because load_lora_weights
+                     requires a non-None .transformer to read its config).
 
     This avoids loading all LoRAs at once (halves RAM pressure) and
     prevents the duplicate peft_config warning.
@@ -254,7 +259,7 @@ def apply_loras_to_transformer(pipe, cfg: dict, target: str,
 
         print(f"  📦 Loading LoRA: {name} → {target} (scale={scale})")
         try:
-            if target == "transformer_2":
+            if target == "transformer_2" and not load_as_primary:
                 pipe.load_lora_weights(path, adapter_name=name,
                                        load_into_transformer_2=True)
             else:
@@ -265,7 +270,10 @@ def apply_loras_to_transformer(pipe, cfg: dict, target: str,
             print(f"  ❌ LoRA {name}: {e}")
 
     if adapters:
-        model = pipe.transformer if target == "transformer" else pipe.transformer_2
+        if load_as_primary:
+            model = pipe.transformer
+        else:
+            model = pipe.transformer if target == "transformer" else pipe.transformer_2
         if model is not None:
             model.set_adapters(adapters, weights=[scales[a] for a in adapters])
             print(f"  ✅ Active adapters on {target}: {adapters}")
@@ -310,6 +318,256 @@ def remove_offloading(module):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Per-session file loggers
+# ═══════════════════════════════════════════════════════════════════
+
+class SessionLogger:
+    """Writes two human-readable log files per session:
+
+    generation.log — narrative diary of every pipeline event
+    vram.log       — timestamped VRAM/RAM allocation timeline
+    """
+
+    def __init__(self, session_dir: Path):
+        self.session_dir = Path(session_dir)
+        self.gen_path = self.session_dir / "generation.log"
+        self.vram_path = self.session_dir / "vram.log"
+        self._t0: float = time.time()
+        self._peak_alloc: float = 0.0
+        self._peak_reserved: float = 0.0
+        self._last_alloc: float = 0.0
+        self._last_reserved: float = 0.0
+        self._step_t0: float = 0.0
+
+        # Initialise VRAM log with header
+        with open(self.vram_path, "w") as f:
+            f.write(f"{'Elapsed':>8s}  {'Step':<14s}  {'Event':<45s}  "
+                    f"{'Alloc GB':>9s}  {'Rsrv GB':>9s}  {'Free GB':>9s}  "
+                    f"{'Δ Alloc':>9s}  {'Δ Rsrv':>9s}  "
+                    f"{'Peak A':>8s}  {'Peak R':>8s}  "
+                    f"{'RAM Used':>9s}  {'RAM Avail':>10s}\n")
+            f.write("─" * 190 + "\n")
+
+    # ── generation.log helpers ──────────────────────────────────
+
+    def _gwrite(self, text: str):
+        with open(self.gen_path, "a") as f:
+            f.write(text)
+
+    def header(self, info, cfg: dict):
+        """Write the generation parameters header."""
+        gpu_name = "N/A"
+        gpu_total = 0.0
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_total = round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2)
+
+        loras = cfg.get("loras", [])
+        lora_overrides = getattr(info, "lora_scales", []) or []
+
+        with open(self.gen_path, "w") as f:
+            f.write("═" * 80 + "\n")
+            f.write(f"  SESSION: {info.session_id}\n")
+            f.write(f"  Started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("═" * 80 + "\n\n")
+
+            f.write("── GPU ──\n")
+            f.write(f"  Device:       {gpu_name}\n")
+            f.write(f"  Total VRAM:   {gpu_total} GB\n")
+            f.write(f"  PyTorch:      {torch.__version__}\n")
+            try:
+                f.write(f"  CUDA/ROCm:    {torch.version.hip or torch.version.cuda or 'N/A'}\n")
+            except Exception:
+                pass
+            f.write(f"  HSA_GFX:      {os.environ.get('HSA_OVERRIDE_GFX_VERSION', 'N/A')}\n")
+            f.write(f"  Alloc conf:   {os.environ.get('PYTORCH_HIP_ALLOC_CONF', 'N/A')}\n\n")
+
+            f.write("── Generation Parameters ──\n")
+            f.write(f"  Prompt:           {info.prompt}\n")
+            f.write(f"  Negative prompt:  {info.negative_prompt}\n")
+            f.write(f"  Resolution:       {info.width}×{info.height} ({info.width*info.height/1e6:.2f} MP)\n")
+            f.write(f"  Frames:           {info.num_frames} ({info.duration}s @ {info.fps}fps)\n")
+            f.write(f"  Output FPS:       {info.output_fps}\n")
+            f.write(f"  Steps / pass:     {info.num_inference_steps} (total: {info.num_inference_steps * 2})\n")
+            f.write(f"  CFG High:         {info.guidance_scale}\n")
+            f.write(f"  CFG Low:          {info.guidance_scale_2}\n")
+            f.write(f"  Flow shift:       {info.flow_shift}\n")
+            br = getattr(info, "boundary_ratio", 0.5)
+            f.write(f"  Boundary ratio:   {br}\n")
+            f.write(f"  Seed:             {info.seed}\n")
+            f.write(f"  Upscale:          {info.enable_upscale}\n\n")
+
+            f.write("── Memory Settings ──\n")
+            f.write(f"  Offload type:     {cfg.get('offload_type', 'block_level')}\n")
+            f.write(f"  Blocks/group:     {cfg.get('num_blocks_per_group', 1)}\n")
+            f.write(f"  Group offload:    {cfg.get('enable_group_offload', True)}\n")
+            f.write(f"  VAE tiling:       {cfg.get('vae_tiling', True)}\n")
+            f.write(f"  VAE slicing:      {cfg.get('vae_slicing', True)}\n")
+            f.write(f"  Force VAE CPU:    {cfg.get('force_vae_cpu', False)}\n")
+            amd = cfg.get("amd", {})
+            f.write(f"  Force FP16:       {amd.get('force_fp16', False)}\n\n")
+
+            f.write("── LoRA Configuration ──\n")
+            for i, lora in enumerate(loras):
+                scale = lora.get("scale", 1.0)
+                if isinstance(lora_overrides, list) and i < len(lora_overrides):
+                    if isinstance(lora_overrides[i], (int, float)):
+                        scale = lora_overrides[i]
+                target = lora.get("target", "transformer")
+                badge = "HIGH" if target == "transformer" else "LOW"
+                path = lora.get("path", "")
+                file_size = "?"
+                try:
+                    sz = os.path.getsize(path)
+                    file_size = f"{sz / 1024**2:.1f} MB"
+                except OSError:
+                    pass
+                f.write(f"  [{i}] {lora['adapter_name']:40s}  {badge:4s}  "
+                        f"scale={scale:<6.3f}  {file_size:>10s}  {os.path.basename(path)}\n")
+            f.write("\n")
+
+            ram = ram_stats()
+            f.write(f"── System RAM at start ──\n")
+            f.write(f"  Total:  {ram.get('total_gb', '?')} GB\n")
+            f.write(f"  Used:   {ram.get('used_gb', '?')} GB\n")
+            f.write(f"  Avail:  {ram.get('available_gb', '?')} GB  ({ram.get('percent', '?')}%)\n\n")
+
+            f.write("═" * 80 + "\n")
+            f.write("  PIPELINE EXECUTION\n")
+            f.write("═" * 80 + "\n\n")
+
+    def step_start(self, step: str):
+        self._step_t0 = time.time()
+        elapsed = self._step_t0 - self._t0
+        self._gwrite(f"\n┌─ STEP: {step.upper()} ─{'─' * (60 - len(step))}\n")
+        self._gwrite(f"│  Started at T+{elapsed:.1f}s  "
+                     f"({time.strftime('%H:%M:%S')})\n")
+        self.vram_event(step, "step_start")
+
+    def step_end(self, step: str, status: str, elapsed: float, error: str = ""):
+        total_elapsed = time.time() - self._t0
+        self._gwrite(f"│\n")
+        self._gwrite(f"│  Status:   {status}\n")
+        self._gwrite(f"│  Duration: {elapsed:.2f}s\n")
+        if error:
+            self._gwrite(f"│  Error:    {error}\n")
+        self._gwrite(f"└─ END {step.upper()} at T+{total_elapsed:.1f}s ─{'─' * (55 - len(step))}\n\n")
+        self.vram_event(step, f"step_end ({status})")
+
+    def log(self, step: str, msg: str):
+        """Write a timestamped line to generation.log."""
+        elapsed = time.time() - self._t0
+        self._gwrite(f"│  [{elapsed:7.1f}s] {msg}\n")
+
+    def log_tensor(self, step: str, name: str, tensor):
+        """Log a tensor's shape, dtype, and device."""
+        if hasattr(tensor, "shape"):
+            self.log(step, f"Tensor {name}: shape={list(tensor.shape)}  "
+                     f"dtype={tensor.dtype}  device={tensor.device}")
+
+    def log_checkpoint_size(self, step: str, path: str | Path):
+        """Log the size of a saved checkpoint file."""
+        try:
+            sz = os.path.getsize(path)
+            if sz > 1024**3:
+                self.log(step, f"Saved {os.path.basename(str(path))}: {sz/1024**3:.2f} GB")
+            else:
+                self.log(step, f"Saved {os.path.basename(str(path))}: {sz/1024**2:.1f} MB")
+        except OSError:
+            pass
+
+    def log_sigmas(self, step: str, full_sigmas, split_step: int,
+                   boundary_sigma: float, boundary_ratio: float):
+        """Log the full sigma schedule."""
+        total = len(full_sigmas)
+        self.log(step, f"Sigma schedule: {total} values, split at step {split_step} "
+                 f"(ratio={boundary_ratio:.2f})")
+        self.log(step, f"Boundary sigma: {boundary_sigma:.6f}")
+        # Log compact sigma list
+        sigma_strs = [f"{s:.4f}" for s in full_sigmas]
+        self.log(step, f"Full sigmas: [{', '.join(sigma_strs)}]")
+        self.log(step, f"Pass 1 ({split_step} steps): "
+                 f"[{', '.join(sigma_strs[:split_step])}]")
+        self.log(step, f"Pass 2 ({total - split_step} steps): "
+                 f"[{', '.join(sigma_strs[split_step:])}]")
+
+    def log_denoise_step(self, step: str, pass_num: int, i: int, total: int,
+                         timestep: float):
+        """Log a single denoise iteration."""
+        v = vram_stats()
+        alloc = v.get("allocated_gb", 0)
+        self.log(step, f"Pass {pass_num} step {i+1}/{total}  "
+                 f"t={timestep:.0f}  VRAM={alloc:.2f} GB")
+
+    def summary(self, info, total_elapsed: float):
+        """Write final summary."""
+        self._gwrite("\n" + "═" * 80 + "\n")
+        self._gwrite("  GENERATION SUMMARY\n")
+        self._gwrite("═" * 80 + "\n\n")
+        self._gwrite(f"  Final status:     {info.status}\n")
+        self._gwrite(f"  Total wall time:  {total_elapsed:.1f}s "
+                     f"({total_elapsed/60:.1f} min)\n")
+        self._gwrite(f"  Completed at:     {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+        self._gwrite("  Per-step breakdown:\n")
+        for step_name in STEP_ORDER:
+            status = info.steps.get(step_name, "pending")
+            t = info.step_times.get(step_name, 0)
+            pct = (t / total_elapsed * 100) if total_elapsed > 0 else 0
+            self._gwrite(f"    {step_name:<12s}  {str(status):<10s}  "
+                         f"{t:7.1f}s  ({pct:4.1f}%)\n")
+
+        self._gwrite(f"\n  VRAM peaks:\n")
+        self._gwrite(f"    Allocated: {self._peak_alloc:.2f} GB\n")
+        self._gwrite(f"    Reserved:  {self._peak_reserved:.2f} GB\n")
+
+        if info.error_message:
+            self._gwrite(f"\n  Error: {info.error_message}\n")
+
+        self._gwrite("\n" + "═" * 80 + "\n")
+
+    # ── vram.log helpers ────────────────────────────────────────
+
+    def vram_event(self, step: str, event: str):
+        """Record a VRAM snapshot to vram.log."""
+        v = vram_stats()
+        r = ram_stats()
+        elapsed = time.time() - self._t0
+        alloc = v.get("allocated_gb", 0)
+        reserved = v.get("reserved_gb", 0)
+        total = v.get("total_gb", 0)
+        free = round(total - reserved, 2) if total else 0
+        d_alloc = round(alloc - self._last_alloc, 3)
+        d_reserved = round(reserved - self._last_reserved, 3)
+
+        if alloc > self._peak_alloc:
+            self._peak_alloc = alloc
+        if reserved > self._peak_reserved:
+            self._peak_reserved = reserved
+
+        self._last_alloc = alloc
+        self._last_reserved = reserved
+
+        d_alloc_str = f"{'+' if d_alloc >= 0 else ''}{d_alloc:.3f}"
+        d_reserved_str = f"{'+' if d_reserved >= 0 else ''}{d_reserved:.3f}"
+
+        ram_used = r.get("used_gb", 0)
+        ram_avail = r.get("available_gb", 0)
+
+        with open(self.vram_path, "a") as f:
+            f.write(f"{elapsed:7.1f}s  {step:<14s}  {event:<45s}  "
+                    f"{alloc:8.3f}   {reserved:8.3f}   {free:8.3f}   "
+                    f"{d_alloc_str:>9s}  {d_reserved_str:>9s}  "
+                    f"{self._peak_alloc:7.3f}   {self._peak_reserved:7.3f}   "
+                    f"{ram_used:8.2f}   {ram_avail:9.2f}\n")
+
+    def vram_denoise_sample(self, step: str, pass_num: int, i: int, total: int,
+                            timestep: float):
+        """Compact VRAM row for each denoise iteration."""
+        self.vram_event(step, f"pass{pass_num} step {i+1}/{total} t={timestep:.0f}")
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Pipeline Engine
 # ═══════════════════════════════════════════════════════════════════
 
@@ -328,6 +586,7 @@ class PipelineEngine:
         self.sm = SessionManager()
         self._progress_callback: Callable | None = None
         self._cancel_flag = False
+        self._slog: SessionLogger | None = None  # per-generation session logger
 
     def set_progress_callback(self, cb: Callable):
         """Set callback: cb(session_id, step, progress_pct, message)"""
@@ -347,8 +606,14 @@ class PipelineEngine:
         if not info:
             return False
 
+        # Start session logger (encode is always the first step)
+        sdir = self.sm.session_dir(session_id)
+        self._slog = SessionLogger(sdir)
+        self._slog.header(info, self.cfg)
+
         self.sm.update_step(session_id, "encode", StepStatus.RUNNING)
         self._emit(session_id, "encode", 0, "Loading text encoder…")
+        self._slog.step_start("encode")
         t0 = time.time()
 
         try:
@@ -358,10 +623,14 @@ class PipelineEngine:
             dtype = torch.float16 if force_fp16 else torch.bfloat16
 
             self._emit(session_id, "encode", 10, "Loading tokenizer + text encoder…")
+            self._slog.log("encode", f"Loading tokenizer + text encoder (dtype={dtype})")
+            self._slog.vram_event("encode", "before text_encoder load")
             tokenizer, text_encoder = load_text_encoder(cfg)
             text_encoder.to("cuda")
+            self._slog.vram_event("encode", "text_encoder on GPU")
 
             self._emit(session_id, "encode", 30, "Encoding prompt…")
+            self._slog.log("encode", "Tokenizing prompt…")
             prompt_ids = tokenizer(
                 info.prompt, max_length=512, padding="max_length",
                 truncation=True, return_tensors="pt",
@@ -379,8 +648,13 @@ class PipelineEngine:
                     neg_ids.input_ids.to("cuda")
                 ).last_hidden_state
 
+            self._slog.log_tensor("encode", "prompt_embeds", prompt_embeds)
+            self._slog.log_tensor("encode", "negative_prompt_embeds", neg_embeds)
+            self._slog.vram_event("encode", "after encoding")
+
             del text_encoder, tokenizer
             flush_vram()
+            self._slog.vram_event("encode", "after cleanup")
             print(f"  === ENCODE CLEANUP === VRAM: {vram_stats()}", flush=True)
             self._emit(session_id, "encode", 90, "Text encoded, saving checkpoint…")
 
@@ -389,9 +663,12 @@ class PipelineEngine:
                 "negative_prompt_embeds": neg_embeds.cpu(),
             }
             self.sm.save_checkpoint(session_id, "embeddings", checkpoint)
+            self._slog.log_checkpoint_size("encode",
+                self.sm.session_dir(session_id) / "embeddings.pt")
 
             elapsed = time.time() - t0
             self.sm.update_step(session_id, "encode", StepStatus.DONE, elapsed)
+            self._slog.step_end("encode", "done", elapsed)
             self._emit(session_id, "encode", 100,
                        f"Text encoding done in {elapsed:.1f}s")
             flush_vram()
@@ -401,6 +678,10 @@ class PipelineEngine:
             elapsed = time.time() - t0
             self.sm.update_step(session_id, "encode", StepStatus.FAILED,
                                 elapsed, str(e))
+            if self._slog:
+                self._slog.log("encode", f"EXCEPTION: {e}")
+                self._slog.log("encode", traceback.format_exc())
+                self._slog.step_end("encode", "FAILED", elapsed, str(e))
             self._emit(session_id, "encode", -1, f"Encode failed: {e}")
             traceback.print_exc()
             for v in list(locals().values()):
@@ -441,12 +722,16 @@ class PipelineEngine:
 
         self.sm.update_step(session_id, "denoise", StepStatus.RUNNING)
         self._emit(session_id, "denoise", 0, "Starting denoise…")
+        if self._slog:
+            self._slog.step_start("denoise")
         t0 = time.time()
 
         # Pre-clean
         gc.collect()
         flush_vram()
         print(f"  === DENOISE START === VRAM: {vram_stats()}  RAM: {ram_stats()}", flush=True)
+        if self._slog:
+            self._slog.vram_event("denoise", "pre-clean")
 
         try:
             from diffusers import WanImageToVideoPipeline
@@ -474,6 +759,8 @@ class PipelineEngine:
             #  PHASE 1: VAE encode input image → latents + condition
             # ══════════════════════════════════════════════════════════
             self._emit(session_id, "denoise", 3, "Loading VAE…")
+            if self._slog:
+                self._slog.log("denoise", f"PHASE 1: VAE encode (device={vae_device}, tiling={cfg.get('vae_tiling', True)}, slicing={cfg.get('vae_slicing', True)})")
             vae = load_vae(cfg)
 
             if cfg.get("vae_tiling", True):
@@ -484,6 +771,8 @@ class PipelineEngine:
             vae_device = "cpu" if force_vae_cpu else "cuda"
             vae.to(vae_device)
             print(f"  VAE on {vae_device}. VRAM: {vram_stats()}", flush=True)
+            if self._slog:
+                self._slog.vram_event("denoise", f"VAE loaded on {vae_device}")
 
             # Load a temporary transformer ONLY to read config values
             # (vae_scale_factor_spatial, z_dim, image_dim).  This loads
@@ -514,6 +803,9 @@ class PipelineEngine:
             del transformer_cfg_reader
             gc.collect()
             print(f"  Config read done. VRAM: {vram_stats()}  RAM: {ram_stats()}")
+            if self._slog:
+                self._slog.log("denoise", f"vae_scale_factor={vae_scale_factor}, z_dim={num_channels_latents}, image_dim={image_dim}")
+                self._slog.vram_event("denoise", "config reader freed")
 
             # Prepare image
             image = prepare_image(info.input_image, info.width, info.height)
@@ -578,6 +870,11 @@ class PipelineEngine:
             latents = latents.to("cuda", dtype=dtype)
             condition = condition.to("cuda", dtype=dtype)
             print(f"  VRAM after prepare_latents: {vram_stats()}")
+            if self._slog:
+                self._slog.log_tensor("denoise", "latents", latents)
+                self._slog.log_tensor("denoise", "condition", condition)
+                self._slog.log_tensor("denoise", "prompt_embeds", prompt_embeds)
+                self._slog.vram_event("denoise", "after prepare_latents")
 
             # Free VAE completely
             pipe_vae.vae.to("meta")
@@ -586,6 +883,8 @@ class PipelineEngine:
             gc.collect()
             flush_vram()
             print(f"  Freed VAE. VRAM: {vram_stats()}  RAM: {ram_stats()}")
+            if self._slog:
+                self._slog.vram_event("denoise", "VAE freed")
 
             # CLIP image embeddings (if transformer expects them)
             image_embeds = None
@@ -609,6 +908,9 @@ class PipelineEngine:
                 del img_enc, img_proc, img_input
                 flush_vram()
                 print(f"  Freed CLIP encoder. VRAM: {vram_stats()}")
+                if self._slog:
+                    self._slog.log_tensor("denoise", "image_embeds", image_embeds)
+                    self._slog.vram_event("denoise", "CLIP encoder freed")
 
             # ══════════════════════════════════════════════════════════
             #  SIGMA SCHEDULE
@@ -616,19 +918,31 @@ class PipelineEngine:
             steps_per_pass = info.num_inference_steps
             total_steps = steps_per_pass * 2
 
+            # boundary_ratio controls where the high→low split happens
+            boundary_ratio = cfg.get("boundary_ratio", 0.5)
+            # Also check session-level override
+            if hasattr(info, "boundary_ratio") and info.boundary_ratio is not None:
+                boundary_ratio = info.boundary_ratio
+            boundary_ratio = max(0.1, min(0.9, float(boundary_ratio)))
+
             full_sched = UniPCMultistepScheduler.from_config(
                 sched.config, flow_shift=flow_shift,
             )
             full_sched.set_timesteps(total_steps)
             full_sigmas = full_sched.sigmas.numpy().copy()
 
-            pass1_input = full_sigmas[0:steps_per_pass]
-            pass2_input = full_sigmas[steps_per_pass:total_steps]
-            boundary_sigma = float(full_sigmas[steps_per_pass])
+            # Split point: round to nearest step boundary
+            split_step = max(1, min(total_steps - 1, round(total_steps * boundary_ratio)))
+            pass1_input = full_sigmas[0:split_step]
+            pass2_input = full_sigmas[split_step:total_steps]
+            boundary_sigma = float(full_sigmas[split_step])
 
-            print(f"  Schedule: {steps_per_pass}+{steps_per_pass}={total_steps} steps, "
-                  f"boundary={boundary_sigma:.6f}")
+            print(f"  Schedule: {split_step}+{total_steps - split_step}={total_steps} steps, "
+                  f"boundary_ratio={boundary_ratio:.2f}, boundary={boundary_sigma:.6f}")
             print(f"  Sigmas: {[f'{s:.4f}' for s in full_sigmas]}")
+            if self._slog:
+                self._slog.log_sigmas("denoise", full_sigmas, split_step,
+                                      boundary_sigma, boundary_ratio)
 
             guidance_scale = info.guidance_scale
             guidance_scale_2 = info.guidance_scale_2
@@ -648,6 +962,9 @@ class PipelineEngine:
 
             transformer_high = load_single_transformer(cfg, "high")
             print(f"  RAM after high-noise load: {ram_stats()}")
+            if self._slog:
+                self._slog.log("denoise", "High-noise transformer loaded")
+                self._slog.vram_event("denoise", "high-noise transformer loaded")
 
             # Temporary pipe for LoRA loading API
             pipe_pass1 = WanImageToVideoPipeline(
@@ -664,6 +981,8 @@ class PipelineEngine:
             apply_loras_to_transformer(pipe_pass1, cfg, "transformer",
                                        info.lora_scales)
             print(f"  VRAM after high-noise LoRAs: {vram_stats()}")
+            if self._slog:
+                self._slog.vram_event("denoise", "high-noise LoRAs applied")
 
             # Group offloading
             if use_offload:
@@ -679,6 +998,9 @@ class PipelineEngine:
                     offload_kwargs["num_blocks_per_group"] = num_blocks
                 apply_group_offloading(pipe_pass1.transformer, **offload_kwargs)
                 print(f"  VRAM after offload setup: {vram_stats()}")
+                if self._slog:
+                    self._slog.log("denoise", f"High-noise offloading: {offload_type}, num_blocks={num_blocks}")
+                    self._slog.vram_event("denoise", "high-noise offload setup")
 
             # Scheduler
             sched_high = UniPCMultistepScheduler.from_config(
@@ -728,8 +1050,14 @@ class PipelineEngine:
 
                 latents = sched_high.step(noise_pred, t, latents,
                                           return_dict=False)[0]
+                if self._slog:
+                    self._slog.log_denoise_step("denoise", 1, i, len(timesteps_high), float(t))
+                    self._slog.vram_denoise_sample("denoise", 1, i, len(timesteps_high), float(t))
 
             print(f"  Pass 1 complete. VRAM: {vram_stats()}")
+            if self._slog:
+                self._slog.log("denoise", f"Pass 1 complete ({len(timesteps_high)} steps)")
+                self._slog.vram_event("denoise", "pass 1 complete")
 
             # ── Free high-noise transformer completely ──
             remove_offloading(pipe_pass1.transformer)
@@ -739,6 +1067,8 @@ class PipelineEngine:
             gc.collect()
             flush_vram()
             print(f"  Freed high-noise. VRAM: {vram_stats()}  RAM: {ram_stats()}")
+            if self._slog:
+                self._slog.vram_event("denoise", "high-noise transformer freed")
 
             # ══════════════════════════════════════════════════════════
             #  PASS 2: Low-noise transformer (load → LoRA → offload → run → free)
@@ -749,22 +1079,30 @@ class PipelineEngine:
 
             transformer_low = load_single_transformer(cfg, "low")
             print(f"  RAM after low-noise load: {ram_stats()}")
+            if self._slog:
+                self._slog.log("denoise", "Low-noise transformer loaded")
+                self._slog.vram_event("denoise", "low-noise transformer loaded")
 
             pipe_pass2 = WanImageToVideoPipeline(
                 tokenizer=tokenizer,
                 text_encoder=None,
-                transformer=None,
-                transformer_2=transformer_low,
+                transformer=transformer_low,
                 vae=None,
                 scheduler=sched,
                 image_processor=None,
             )
 
             # LoRAs for low-noise ONLY
+            # We load into pipe.transformer (not transformer_2) because
+            # load_lora_weights needs a non-None .transformer to read config.
+            # target="transformer_2" is only used to filter the config entries.
             self._emit(session_id, "denoise", 54, "Loading low-noise LoRAs…")
             apply_loras_to_transformer(pipe_pass2, cfg, "transformer_2",
-                                       info.lora_scales)
+                                       info.lora_scales,
+                                       load_as_primary=True)
             print(f"  VRAM after low-noise LoRAs: {vram_stats()}")
+            if self._slog:
+                self._slog.vram_event("denoise", "low-noise LoRAs applied")
 
             # Group offloading
             if use_offload:
@@ -778,8 +1116,11 @@ class PipelineEngine:
                 )
                 if offload_type == "block_level":
                     offload_kwargs["num_blocks_per_group"] = num_blocks
-                apply_group_offloading(pipe_pass2.transformer_2, **offload_kwargs)
+                apply_group_offloading(pipe_pass2.transformer, **offload_kwargs)
                 print(f"  VRAM after offload setup: {vram_stats()}")
+                if self._slog:
+                    self._slog.log("denoise", f"Low-noise offloading: {offload_type}, num_blocks={num_blocks}")
+                    self._slog.vram_event("denoise", "low-noise offload setup")
 
             # Scheduler
             sched_low = UniPCMultistepScheduler.from_config(
@@ -790,7 +1131,7 @@ class PipelineEngine:
             print(f"  Pass 2 timesteps: {timesteps_low.tolist()}")
 
             do_cfg_2 = guidance_scale_2 > 1.0
-            current_model = pipe_pass2.transformer_2
+            current_model = pipe_pass2.transformer
 
             # ── Denoise loop (Pass 2) ──
             for i, t in enumerate(timesteps_low):
@@ -830,16 +1171,25 @@ class PipelineEngine:
 
                 latents = sched_low.step(noise_pred, t, latents,
                                          return_dict=False)[0]
+                if self._slog:
+                    self._slog.log_denoise_step("denoise", 2, i, len(timesteps_low), float(t))
+                    self._slog.vram_denoise_sample("denoise", 2, i, len(timesteps_low), float(t))
 
             print(f"  Pass 2 complete. VRAM: {vram_stats()}")
+            if self._slog:
+                self._slog.log("denoise", f"Pass 2 complete ({len(timesteps_low)} steps)")
+                self._slog.vram_event("denoise", "pass 2 complete")
 
             # ── Save result ──
             self.sm.save_checkpoint(session_id, "latents", latents.cpu())
+            if self._slog:
+                self._slog.log_checkpoint_size("denoise",
+                    self.sm.session_dir(session_id) / "latents.pt")
 
             # Free everything
-            remove_offloading(pipe_pass2.transformer_2)
-            pipe_pass2.transformer_2.to("meta")
-            pipe_pass2.transformer_2 = None
+            remove_offloading(pipe_pass2.transformer)
+            pipe_pass2.transformer.to("meta")
+            pipe_pass2.transformer = None
             del pipe_pass2, current_model, transformer_low
             del latents, condition, prompt_embeds, negative_prompt_embeds
             if image_embeds is not None:
@@ -849,6 +1199,9 @@ class PipelineEngine:
 
             elapsed = time.time() - t0
             self.sm.update_step(session_id, "denoise", StepStatus.DONE, elapsed)
+            if self._slog:
+                self._slog.vram_event("denoise", "all freed")
+                self._slog.step_end("denoise", "done", elapsed)
             self._emit(session_id, "denoise", 100,
                        f"Denoising done in {elapsed:.1f}s ({total_steps} steps)")
             print(f"  === DENOISE DONE === VRAM: {vram_stats()}  RAM: {ram_stats()}",
@@ -859,6 +1212,9 @@ class PipelineEngine:
             elapsed = time.time() - t0
             self.sm.update_step(session_id, "denoise", StepStatus.FAILED,
                                 elapsed, "Cancelled by user")
+            if self._slog:
+                self._slog.log("denoise", "CANCELLED by user")
+                self._slog.step_end("denoise", "CANCELLED", elapsed, "Cancelled by user")
             self._emit(session_id, "denoise", -1, "Cancelled")
             for v in list(locals().values()):
                 if isinstance(v, torch.nn.Module):
@@ -874,6 +1230,10 @@ class PipelineEngine:
             elapsed = time.time() - t0
             self.sm.update_step(session_id, "denoise", StepStatus.FAILED,
                                 elapsed, str(e))
+            if self._slog:
+                self._slog.log("denoise", f"EXCEPTION: {e}")
+                self._slog.log("denoise", traceback.format_exc())
+                self._slog.step_end("denoise", "FAILED", elapsed, str(e))
             self._emit(session_id, "denoise", -1, f"Denoise failed: {e}")
             traceback.print_exc()
             for v in list(locals().values()):
@@ -901,6 +1261,8 @@ class PipelineEngine:
 
         self.sm.update_step(session_id, "vae_decode", StepStatus.RUNNING)
         self._emit(session_id, "vae_decode", 0, "Loading VAE…")
+        if self._slog:
+            self._slog.step_start("vae_decode")
         t0 = time.time()
 
         try:
@@ -913,10 +1275,15 @@ class PipelineEngine:
                 vae.enable_slicing()
 
             vae.to("cuda")
+            if self._slog:
+                self._slog.vram_event("vae_decode", "VAE loaded on GPU")
 
             self._emit(session_id, "vae_decode", 20, "Loading latents…")
             latents = self.sm.load_checkpoint(session_id, "latents")
             latents = latents.to("cuda", dtype=torch.float32)
+            if self._slog:
+                self._slog.log_tensor("vae_decode", "latents", latents)
+                self._slog.vram_event("vae_decode", "latents loaded to GPU")
 
             self._emit(session_id, "vae_decode", 30, "Decoding latents → frames…")
 
@@ -944,15 +1311,23 @@ class PipelineEngine:
             frames_np = frames_tensor.numpy()
             self.sm.save_checkpoint(session_id, "frames",
                                     torch.from_numpy(frames_np))
+            if self._slog:
+                self._slog.log("vae_decode", f"Decoded {frames_np.shape[0]} frames, shape={frames_np.shape}")
+                self._slog.log_checkpoint_size("vae_decode",
+                    self.sm.session_dir(session_id) / "frames.pt")
 
             del vae, latents, frames_tensor
             flush_vram()
+            if self._slog:
+                self._slog.vram_event("vae_decode", "VAE freed")
 
             self._emit(session_id, "vae_decode", 90, "Saving preview…")
             self._export_preview(session_id, frames_np, info.fps)
 
             elapsed = time.time() - t0
             self.sm.update_step(session_id, "vae_decode", StepStatus.DONE, elapsed)
+            if self._slog:
+                self._slog.step_end("vae_decode", "done", elapsed)
             self._emit(session_id, "vae_decode", 100,
                        f"VAE decode done in {elapsed:.1f}s")
             return True
@@ -961,6 +1336,10 @@ class PipelineEngine:
             elapsed = time.time() - t0
             self.sm.update_step(session_id, "vae_decode", StepStatus.FAILED,
                                 elapsed, str(e))
+            if self._slog:
+                self._slog.log("vae_decode", f"EXCEPTION: {e}")
+                self._slog.log("vae_decode", traceback.format_exc())
+                self._slog.step_end("vae_decode", "FAILED", elapsed, str(e))
             self._emit(session_id, "vae_decode", -1, f"VAE decode failed: {e}")
             traceback.print_exc()
             flush_vram()
@@ -995,6 +1374,8 @@ class PipelineEngine:
 
         self.sm.update_step(session_id, "export", StepStatus.RUNNING)
         self._emit(session_id, "export", 0, "Loading frames…")
+        if self._slog:
+            self._slog.step_start("export")
         t0 = time.time()
 
         try:
@@ -1002,6 +1383,8 @@ class PipelineEngine:
 
             frames_tensor = self.sm.load_checkpoint(session_id, "frames")
             frames_np = frames_tensor.numpy()
+            if self._slog:
+                self._slog.log("export", f"Loaded {frames_np.shape[0]} frames, shape={frames_np.shape}")
 
             sdir = self.sm.session_dir(session_id)
             video_path = sdir / "output.mp4"
@@ -1030,6 +1413,14 @@ class PipelineEngine:
 
             elapsed = time.time() - t0
             self.sm.update_step(session_id, "export", StepStatus.DONE, elapsed)
+            if self._slog:
+                self._slog.log("export", f"Exported {video_path.name} + copied to {final_path}")
+                try:
+                    sz = os.path.getsize(video_path)
+                    self._slog.log("export", f"File size: {sz/1024**2:.1f} MB")
+                except OSError:
+                    pass
+                self._slog.step_end("export", "done", elapsed)
             self._emit(session_id, "export", 100,
                        f"Video exported in {elapsed:.1f}s")
             return True
@@ -1038,6 +1429,9 @@ class PipelineEngine:
             elapsed = time.time() - t0
             self.sm.update_step(session_id, "export", StepStatus.FAILED,
                                 elapsed, str(e))
+            if self._slog:
+                self._slog.log("export", f"EXCEPTION: {e}")
+                self._slog.step_end("export", "FAILED", elapsed, str(e))
             self._emit(session_id, "export", -1, f"Export failed: {e}")
             traceback.print_exc()
             return False
@@ -1052,6 +1446,8 @@ class PipelineEngine:
         if not info.enable_upscale:
             self.sm.update_step(session_id, "upscale", StepStatus.SKIPPED)
             self._emit(session_id, "upscale", 100, "Upscale skipped")
+            if self._slog:
+                self._slog.log("upscale", "Skipped (enable_upscale=False)")
             return True
 
         video_path = self.sm.get_file_path(session_id, "output.mp4")
@@ -1062,6 +1458,8 @@ class PipelineEngine:
 
         self.sm.update_step(session_id, "upscale", StepStatus.RUNNING)
         self._emit(session_id, "upscale", 0, "Starting upscale…")
+        if self._slog:
+            self._slog.step_start("upscale")
         t0 = time.time()
 
         try:
@@ -1073,6 +1471,9 @@ class PipelineEngine:
             upscale_cfg = dict(self.cfg)
             upscale_cfg["fps"] = info.fps
             upscale_cfg["output_fps"] = getattr(info, "output_fps", info.fps)
+            if self._slog:
+                self._slog.log("upscale", f"Input: {video_path}, Output: {up_path}")
+                self._slog.log("upscale", f"fps={info.fps}, output_fps={upscale_cfg['output_fps']}")
 
             upscale_video(str(video_path), up_path, upscale_cfg)
 
@@ -1083,6 +1484,14 @@ class PipelineEngine:
 
             elapsed = time.time() - t0
             self.sm.update_step(session_id, "upscale", StepStatus.DONE, elapsed)
+            if self._slog:
+                try:
+                    sz = os.path.getsize(up_path)
+                    self._slog.log("upscale", f"Output size: {sz/1024**2:.1f} MB")
+                except OSError:
+                    pass
+                self._slog.vram_event("upscale", "upscale complete")
+                self._slog.step_end("upscale", "done", elapsed)
             self._emit(session_id, "upscale", 100,
                        f"Upscale done in {elapsed:.1f}s")
             flush_vram()
@@ -1092,6 +1501,10 @@ class PipelineEngine:
             elapsed = time.time() - t0
             self.sm.update_step(session_id, "upscale", StepStatus.FAILED,
                                 elapsed, str(e))
+            if self._slog:
+                self._slog.log("upscale", f"EXCEPTION: {e}")
+                self._slog.log("upscale", traceback.format_exc())
+                self._slog.step_end("upscale", "FAILED", elapsed, str(e))
             self._emit(session_id, "upscale", -1, f"Upscale failed: {e}")
             traceback.print_exc()
             flush_vram()
@@ -1104,6 +1517,12 @@ class PipelineEngine:
         info = self.sm.get_session(session_id)
         if not info:
             return False
+
+        # Init session logger if not already done (resume case)
+        if self._slog is None or start_step != "encode":
+            sdir = self.sm.session_dir(session_id)
+            self._slog = SessionLogger(sdir)
+            self._slog.header(info, self.cfg)
 
         self.sm.update_status(session_id, "running")
 
@@ -1120,15 +1539,29 @@ class PipelineEngine:
         for step_name in STEP_ORDER[start_idx:]:
             if self._cancel_flag:
                 self.sm.update_status(session_id, "cancelled")
+                if self._slog:
+                    info = self.sm.get_session(session_id)
+                    if info:
+                        self._slog.summary(info, time.time() - self._slog._t0)
+                    self._slog = None
                 return False
 
             success = step_funcs[step_name](session_id)
             if not success:
                 info = self.sm.get_session(session_id)
                 if info and info.steps.get(step_name) == StepStatus.FAILED:
+                    if self._slog:
+                        self._slog.summary(info, time.time() - self._slog._t0)
+                        self._slog = None
                     return False
 
         self.sm.update_status(session_id, "done")
+        # Write final summary
+        if self._slog:
+            info = self.sm.get_session(session_id)
+            if info:
+                self._slog.summary(info, time.time() - self._slog._t0)
+            self._slog = None
         return True
 
     def get_resume_step(self, session_id: str) -> str:

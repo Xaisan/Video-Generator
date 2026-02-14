@@ -7,12 +7,12 @@
   let currentSessionId = null;
   let sessions = [];
   let evtSource = null;
-  let generationStartTime = null;
-  let timerInterval = null;
-  let autoRefreshInterval = null;
-  let logPollInterval = null;
-  let lastLogTs = 0;
-  let stepProgressData = {};
+  let generationStartTime = null;      // epoch ms when generation started
+  let timerInterval = null;             // setInterval for elapsed timer
+  let autoRefreshInterval = null;       // polling during running session
+  let logPollInterval = null;           // log polling interval
+  let lastLogTs = 0;                    // last log timestamp fetched
+  let stepProgressData = {};            // { step: pct } for per-step mini-bars
 
   // ─── DOM refs ───────────────────────────────────────────────
   const $ = (s) => document.querySelector(s);
@@ -33,91 +33,57 @@
   const previewImg = $("#preview-img");
   const dropText = $("#drop-text");
 
-  // ─── Hybrid slider ↔ number sync ───────────────────────────
-  // Each hybrid pair: range slider + number input stay in sync.
-  // The number input allows precise typing; the slider gives quick drag.
+  // ─── Slider value display + duration↔frames ─────────────────
+  function setupSliders() {
+    // Map: slider id → value display span id
+    const sliderMap = {
+      "width": "width-val",
+      "height": "height-val",
+      "duration": "duration-val",
+      "fps": "fps-val",
+      "steps": "steps-val",
+      "cfg": "cfg-val",
+      "cfg2": "cfg2-val",
+      "flow-shift": "flow-shift-val",
+      "output-fps": "output-fps-val",
+    };
 
-  const HYBRID_PAIRS = [
-    // [rangeSliderId, numberInputId]
-    ["width",              "width-num"],
-    ["height",             "height-num"],
-    ["duration",           "duration-num"],
-    ["fps",                "fps-num"],
-    ["output-fps",         "output-fps-num"],
-    ["steps",              "steps-num"],
-    ["cfg",                "cfg-num"],
-    ["cfg2",               "cfg2-num"],
-    ["flow-shift",         "flow-shift-num"],
-    ["boundary-ratio",     "boundary-ratio-num"],
-    ["num-blocks-per-group","num-blocks-per-group-num"],
-  ];
-
-  function setupHybridInputs() {
-    for (const [rangeId, numId] of HYBRID_PAIRS) {
-      const range = $(`#${rangeId}`);
-      const num = $(`#${numId}`);
-      if (!range || !num) continue;
-
-      // Slider → number
-      range.addEventListener("input", () => {
-        num.value = range.value;
-        onParamChange(rangeId);
-      });
-
-      // Number → slider
-      num.addEventListener("input", () => {
-        range.value = num.value;
-        onParamChange(rangeId);
-      });
-
-      // On blur, clamp number to slider min/max
-      num.addEventListener("blur", () => {
-        let v = parseFloat(num.value);
-        const mn = parseFloat(range.min);
-        const mx = parseFloat(range.max);
-        if (isNaN(v)) v = parseFloat(range.value);
-        v = Math.max(mn, Math.min(mx, v));
-        num.value = v;
-        range.value = v;
-        onParamChange(rangeId);
-      });
+    for (const [sliderId, labelId] of Object.entries(sliderMap)) {
+      const slider = $(`#${sliderId}`);
+      const label = $(`#${labelId}`);
+      if (slider && label) {
+        slider.addEventListener("input", () => {
+          label.textContent = slider.value;
+          // Recalculate frames when duration or fps change
+          if (sliderId === "duration" || sliderId === "fps") {
+            updateFramesFromDuration();
+          }
+          if (sliderId === "fps" || sliderId === "output-fps") {
+            updateInterpHint();
+          }
+        });
+      }
     }
 
-    // LoRA hybrid pairs
-    setupLoraHybridInputs();
-  }
-
-  function setupLoraHybridInputs() {
-    $$(".lora-scale").forEach(range => {
-      const idx = range.dataset.lora;
-      const num = $(`.lora-scale-num[data-lora="${idx}"]`);
-      if (!num) return;
-
-      range.addEventListener("input", () => { num.value = range.value; });
-      num.addEventListener("input", () => { range.value = num.value; });
-      num.addEventListener("blur", () => {
-        let v = parseFloat(num.value);
-        if (isNaN(v)) v = parseFloat(range.value);
-        v = Math.max(0, Math.min(5, v));
-        num.value = v;
-        range.value = v;
+    // LoRA slider value displays
+    $$(".lora-scale").forEach(slider => {
+      slider.addEventListener("input", () => {
+        const valSpan = slider.parentElement.querySelector(".lora-val");
+        if (valSpan) valSpan.textContent = slider.value;
       });
     });
-  }
 
-  // Called when any parameter slider/number changes
-  function onParamChange(id) {
-    if (id === "duration" || id === "fps") updateFramesFromDuration();
-    if (id === "fps" || id === "output-fps") updateInterpHint();
-    if (id === "width" || id === "height") updateMegapixels();
-    if (id === "steps") updateTotalSteps();
+    // Initialize computed values
+    updateFramesFromDuration();
+    updateInterpHint();
   }
-
-  // ─── Computed values ────────────────────────────────────────
 
   function calcFrames4k1(duration, fps) {
+    // Wan 2.2 frame count rule: frames must be 4k+1
+    // frames = round(duration * fps), then snap to nearest 4k+1
     let raw = Math.round(duration * fps);
     if (raw < 5) raw = 5;
+    // Snap to 4k+1: frames = ((raw - 1) / 4) * 4 + 1
     let frames = Math.round((raw - 1) / 4) * 4 + 1;
     if (frames < 5) frames = 5;
     return frames;
@@ -138,26 +104,12 @@
     if (!hint) return;
     if (outputFps > fps) {
       const ratio = Math.round(outputFps / fps);
-      hint.textContent = `RIFE: ${fps}→${outputFps} (~${ratio}×)`;
+      hint.textContent = `RIFE: ${fps}→${outputFps}fps (~${ratio}×)`;
       hint.style.color = "var(--success)";
     } else {
-      hint.textContent = `No interp (${fps}fps)`;
+      hint.textContent = `No interpolation (${fps}fps)`;
       hint.style.color = "var(--text-muted)";
     }
-  }
-
-  function updateMegapixels() {
-    const w = parseInt($("#width").value) || 832;
-    const h = parseInt($("#height").value) || 480;
-    const mp = (w * h / 1e6).toFixed(2);
-    const el = $("#mpx-computed");
-    if (el) el.textContent = mp;
-  }
-
-  function updateTotalSteps() {
-    const steps = parseInt($("#steps").value) || 8;
-    const el = $("#total-steps");
-    if (el) el.textContent = steps * 2;
   }
 
   // ─── Toast notification system ──────────────────────────────
@@ -167,6 +119,7 @@
     el.className = `toast toast-${type}`;
     el.textContent = message;
     container.appendChild(el);
+
     setTimeout(() => {
       el.classList.add("toast-out");
       setTimeout(() => el.remove(), 300);
@@ -203,11 +156,13 @@
     });
 
     evtSource.addEventListener("progress", (e) => {
-      handleProgress(JSON.parse(e.data));
+      const d = JSON.parse(e.data);
+      handleProgress(d);
     });
 
     evtSource.addEventListener("generation_complete", (e) => {
-      handleComplete(JSON.parse(e.data));
+      const d = JSON.parse(e.data);
+      handleComplete(d);
     });
 
     evtSource.onerror = () => {
@@ -217,6 +172,7 @@
   }
 
   function handleProgress(d) {
+    // Update progress bar
     const pFill = $("#progress-fill");
     const pMsg = $("#progress-msg");
     const pSec = $("#progress-section");
@@ -226,15 +182,22 @@
       pMsg.textContent = `[${d.step}] ${d.message}  (${d.percent.toFixed(1)}%)`;
     }
 
+    // Update step card
     const card = $(`.step-card[data-step="${d.step}"]`);
     if (card) {
       card.setAttribute("data-state", "running");
       card.querySelector(".step-status").textContent = "running";
+
+      // Per-step mini progress bar
       stepProgressData[d.step] = d.percent;
       const fill = card.querySelector(".step-progress-fill");
-      if (fill) fill.style.width = Math.min(100, d.percent) + "%";
+      if (fill) {
+        // Map the overall percent range to step-local 0-100
+        fill.style.width = Math.min(100, d.percent) + "%";
+      }
     }
 
+    // Update VRAM bars (sidebar + detail)
     if (d.vram && d.vram.allocated_gb !== undefined) {
       updateVRAM(d.vram);
       updateVRAMDetail(d.vram);
@@ -244,26 +207,29 @@
   function handleComplete(d) {
     stopTimer();
     stopAutoRefresh();
-    stopSessionLogPolling();
-
-    // Final fetch of session logs to capture summary
-    fetchSessionLogs();
 
     const session = d.session || {};
     const status = session.status || "done";
 
-    if (status === "done") toast("Generation complete! 🎉", "success");
-    else if (status === "failed") toast("Generation failed: " + (session.error_message || "unknown error"), "error", 8000);
-    else if (status === "cancelled") toast("Generation cancelled", "warning");
+    if (status === "done") {
+      toast("Generation complete! 🎉", "success");
+    } else if (status === "failed") {
+      toast("Generation failed: " + (session.error_message || "unknown error"), "error", 8000);
+    } else if (status === "cancelled") {
+      toast("Generation cancelled", "warning");
+    }
 
+    // Refresh session list and detail
     refreshSessions().then(() => {
-      if (d.session_id === currentSessionId) showSession(d.session_id);
+      if (d.session_id === currentSessionId) {
+        showSession(d.session_id);
+      }
     });
     btnCancel.style.display = "none";
     btnGenerate.disabled = false;
   }
 
-  // ─── VRAM ───────────────────────────────────────────────────
+  // ─── VRAM (sidebar) ────────────────────────────────────────
   function updateVRAM(v) {
     const fill = $(".vram-fill");
     const label = $(".vram-label");
@@ -273,21 +239,27 @@
     const pct = Math.min(100, (used / total) * 100);
     fill.style.width = pct + "%";
     label.textContent = `VRAM: ${used.toFixed(1)} / ${total.toFixed(1)} GB`;
+
+    // Color code
     if (pct > 85) fill.style.background = "linear-gradient(90deg, #f85149, #da3633)";
     else if (pct > 60) fill.style.background = "linear-gradient(90deg, #d29922, #e3b341)";
     else fill.style.background = "";
   }
 
+  // ─── VRAM detail bar (in session view) ──────────────────────
   function updateVRAMDetail(v) {
     const total = v.total_gb || 24;
     const allocated = v.allocated_gb || 0;
     const reserved = v.reserved_gb || 0;
+
     const allocPct = Math.min(100, (allocated / total) * 100);
     const resvPct = Math.min(100, (reserved / total) * 100);
+
     const allocBar = $(".vram-detail-allocated");
     const resvBar = $(".vram-detail-reserved");
     if (allocBar) allocBar.style.width = allocPct + "%";
     if (resvBar) resvBar.style.width = resvPct + "%";
+
     const al = $(".vram-alloc-label");
     const rl = $(".vram-reserved-label");
     const tl = $(".vram-total-label");
@@ -303,7 +275,7 @@
     }).catch(() => {});
   }
 
-  // ─── Timer ──────────────────────────────────────────────────
+  // ─── Timer (elapsed + ETA) ─────────────────────────────────
   function startTimer() {
     generationStartTime = Date.now();
     const timerBar = $("#timer-bar");
@@ -320,8 +292,11 @@
   function updateTimerDisplay() {
     if (!generationStartTime) return;
     const elapsed = Math.floor((Date.now() - generationStartTime) / 1000);
+    const elapsedStr = formatDuration(elapsed);
     const el = $("#timer-elapsed");
-    if (el) el.textContent = `⏱ ${formatDuration(elapsed)}`;
+    if (el) el.textContent = `⏱ ${elapsedStr}`;
+
+    // Estimate ETA from overall progress fill
     const pFill = $("#progress-fill");
     if (pFill) {
       const pct = parseFloat(pFill.style.width) || 0;
@@ -340,7 +315,7 @@
     return `${m}:${s.toString().padStart(2, "0")}`;
   }
 
-  // ─── Auto-refresh ───────────────────────────────────────────
+  // ─── Auto-refresh during running session ────────────────────
   function startAutoRefresh() {
     stopAutoRefresh();
     autoRefreshInterval = setInterval(() => {
@@ -349,8 +324,11 @@
           .then(r => r.json())
           .then(s => {
             if (s.session_id) renderSessionDetail(s);
-            if (s.status !== "running") stopAutoRefresh();
-          }).catch(() => {});
+            if (s.status !== "running") {
+              stopAutoRefresh();
+            }
+          })
+          .catch(() => {});
       }
     }, 3000);
   }
@@ -366,8 +344,9 @@
     lastLogTs = 0;
     const logContent = $("#log-content");
     if (logContent) logContent.innerHTML = "";
+
     logPollInterval = setInterval(fetchLogs, 2000);
-    fetchLogs();
+    fetchLogs(); // immediate first fetch
   }
 
   function stopLogPolling() {
@@ -382,6 +361,7 @@
         if (!lines.length) return;
         const logContent = $("#log-content");
         if (!logContent) return;
+
         for (const line of lines) {
           const span = document.createElement("span");
           span.className = "log-line";
@@ -392,82 +372,11 @@
           logContent.appendChild(document.createTextNode("\n"));
           if (line.ts > lastLogTs) lastLogTs = line.ts;
         }
+
+        // Auto-scroll to bottom
         logContent.scrollTop = logContent.scrollHeight;
-      }).catch(() => {});
-  }
-
-  // ─── Session Log Files (generation.log / vram.log) ──────────
-  let sessionLogPollInterval = null;
-
-  function setupSessionLogTabs() {
-    document.addEventListener("click", (e) => {
-      if (e.target.classList.contains("session-log-tab")) {
-        const tab = e.target.getAttribute("data-logtab");
-        $$(".session-log-tab").forEach(t => t.classList.toggle("active", t.getAttribute("data-logtab") === tab));
-        $$(".session-log-content").forEach(c => c.classList.toggle("active", c.getAttribute("data-logtab") === tab));
-      }
-    });
-
-    const refreshBtn = $("#btn-refresh-logs");
-    if (refreshBtn) refreshBtn.addEventListener("click", () => fetchSessionLogs());
-  }
-
-  function fetchSessionLogs() {
-    if (!currentSessionId) return;
-
-    fetch(`/api/sessions/${currentSessionId}/generation_log`)
-      .then(r => r.json())
-      .then(d => {
-        const el = $("#gen-log-content");
-        if (el) {
-          el.textContent = d.content || "(empty)";
-          // Auto-scroll to bottom if user hasn't scrolled up
-          if (el.scrollHeight - el.scrollTop - el.clientHeight < 100) {
-            el.scrollTop = el.scrollHeight;
-          }
-        }
-        // Show section if log exists
-        const sec = $("#session-logs-section");
-        if (sec && d.exists) sec.style.display = "block";
-      }).catch(() => {});
-
-    fetch(`/api/sessions/${currentSessionId}/vram_log`)
-      .then(r => r.json())
-      .then(d => {
-        const el = $("#vram-log-content");
-        if (el) {
-          el.textContent = d.content || "(empty)";
-          if (el.scrollHeight - el.scrollTop - el.clientHeight < 100) {
-            el.scrollTop = el.scrollHeight;
-          }
-        }
-        const sec = $("#session-logs-section");
-        if (sec && d.exists) sec.style.display = "block";
-      }).catch(() => {});
-  }
-
-  function startSessionLogPolling() {
-    stopSessionLogPolling();
-    fetchSessionLogs();
-    sessionLogPollInterval = setInterval(fetchSessionLogs, 5000);
-  }
-
-  function stopSessionLogPolling() {
-    if (sessionLogPollInterval) clearInterval(sessionLogPollInterval);
-    sessionLogPollInterval = null;
-  }
-
-  function updateSessionLogDownloadLinks(sid) {
-    const genDl = $("#btn-dl-gen-log");
-    const vramDl = $("#btn-dl-vram-log");
-    if (genDl) {
-      genDl.href = `/sessions/${sid}/generation.log`;
-      genDl.download = `${sid.slice(0, 8)}_generation.log`;
-    }
-    if (vramDl) {
-      vramDl.href = `/sessions/${sid}/vram.log`;
-      vramDl.download = `${sid.slice(0, 8)}_vram.log`;
-    }
+      })
+      .catch(() => {});
   }
 
   // ─── Sessions ───────────────────────────────────────────────
@@ -476,7 +385,9 @@
       const r = await fetch("/api/sessions");
       sessions = await r.json();
       renderSessionList();
-    } catch (e) { console.error("Failed to refresh sessions:", e); }
+    } catch (e) {
+      console.error("Failed to refresh sessions:", e);
+    }
   }
 
   function renderSessionList() {
@@ -487,8 +398,11 @@
       const date = new Date(s.created_at * 1000);
       const dateStr = date.toLocaleString();
       const prompt = s.prompt || "(no prompt)";
+
+      // Thumbnail: check if input.png exists in session
       const thumbUrl = `/sessions/${s.session_id}/input.png`;
       const thumbHtml = `<img class="si-thumb" src="${thumbUrl}" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="si-thumb-placeholder" style="display:none">🎬</div>`;
+
       div.innerHTML = `
         ${thumbHtml}
         <div class="si-details">
@@ -508,6 +422,7 @@
   async function showSession(sid) {
     currentSessionId = sid;
     renderSessionList();
+
     try {
       const r = await fetch(`/api/sessions/${sid}`);
       if (!r.ok) return;
@@ -516,44 +431,54 @@
       panelGen.style.display = "none";
       panelSession.style.display = "block";
 
-      // Update log download links and fetch logs
-      updateSessionLogDownloadLinks(sid);
-      fetchSessionLogs();
-
+      // Start auto-refresh and log polling if running
       if (s.status === "running") {
         startAutoRefresh();
         startLogPolling();
-        startSessionLogPolling();
         startTimer();
       } else {
         stopAutoRefresh();
         stopLogPolling();
-        stopSessionLogPolling();
         stopTimer();
       }
-    } catch (e) { console.error(e); }
+    } catch (e) {
+      console.error(e);
+    }
   }
 
   function renderSessionDetail(s) {
     $("#session-title").textContent = `Session ${s.session_id.slice(0, 8)}`;
 
+    // Steps
     const steps = s.steps || {};
     $$(".step-card").forEach(card => {
       const step = card.getAttribute("data-step");
       const status = steps[step] || "pending";
       card.setAttribute("data-state", status);
       card.querySelector(".step-status").textContent = status;
+
+      // Per-step mini progress: set to 100% if done, 0% if pending
       const fill = card.querySelector(".step-progress-fill");
       if (fill) {
-        if (status === "done" || status === "skipped") fill.style.width = "100%";
-        else if (status === "running" && stepProgressData[step] !== undefined) fill.style.width = Math.min(100, stepProgressData[step]) + "%";
-        else if (status === "pending") fill.style.width = "0%";
+        if (status === "done" || status === "skipped") {
+          fill.style.width = "100%";
+        } else if (status === "running" && stepProgressData[step] !== undefined) {
+          fill.style.width = Math.min(100, stepProgressData[step]) + "%";
+        } else if (status === "pending") {
+          fill.style.width = "0%";
+        }
       }
+
+      // Show timing if available
       const timeEl = card.querySelector(".step-time");
-      if (s.step_times && s.step_times[step]) timeEl.textContent = formatStepTime(s.step_times[step]);
-      else timeEl.textContent = "";
+      if (s.step_times && s.step_times[step]) {
+        timeEl.textContent = formatStepTime(s.step_times[step]);
+      } else {
+        timeEl.textContent = "";
+      }
     });
 
+    // Info
     $("#info-prompt").textContent = s.prompt || "—";
     const durStr = s.duration ? `${s.duration}s` : "";
     const outFpsStr = s.output_fps && s.output_fps !== s.fps ? ` → ${s.output_fps}fps` : "";
@@ -563,6 +488,7 @@
     $("#info-cfg").textContent = `${s.guidance_scale} / ${s.guidance_scale_2 || "—"}`;
     $("#info-status").textContent = s.status;
 
+    // Error
     const errorRow = $("#info-error-row");
     const errorEl = $("#info-error");
     if (s.error_message) {
@@ -572,6 +498,7 @@
       errorRow.style.display = "none";
     }
 
+    // Progress
     if (s.status === "running") {
       $("#progress-section").style.display = "block";
       btnCancel.style.display = "inline-flex";
@@ -582,6 +509,7 @@
       $("#timer-bar").style.display = "none";
     }
 
+    // Input image in session detail
     const inputImgSection = $("#input-image-section");
     const sessionImg = $("#session-input-img");
     const inputImgUrl = `/sessions/${s.session_id}/input.png`;
@@ -589,6 +517,7 @@
     sessionImg.onerror = () => { inputImgSection.style.display = "none"; };
     sessionImg.onload = () => { inputImgSection.style.display = "block"; };
 
+    // Video section with tabs
     renderVideoSection(s);
   }
 
@@ -608,25 +537,33 @@
     const origSrc = `/sessions/${s.session_id}/${videoFile}`;
     const upSrc = `/sessions/${s.session_id}/output_upscaled.mp4`;
 
-    $("#video-player").src = origSrc;
+    // Original player
+    const player = $("#video-player");
+    player.src = origSrc;
     const dlBtn = $("#video-download");
     dlBtn.href = origSrc;
     dlBtn.download = `${s.session_id.slice(0,8)}_${videoFile}`;
 
+    // Upscaled tab + player
     const tabUp = $("#tab-upscaled");
     const tabCompare = $("#tab-compare");
     if (hasUpscaled) {
       tabUp.style.display = "";
       tabCompare.style.display = "";
-      $("#video-player-upscaled").src = upSrc;
+
+      const playerUp = $("#video-player-upscaled");
+      playerUp.src = upSrc;
       const dlUp = $("#video-download-upscaled");
       dlUp.href = upSrc;
       dlUp.download = `${s.session_id.slice(0,8)}_upscaled.mp4`;
+
+      // Comparison videos
       $("#video-compare-orig").src = origSrc;
       $("#video-compare-up").src = upSrc;
     } else {
       tabUp.style.display = "none";
       tabCompare.style.display = "none";
+      // Reset to original tab if on hidden tab
       activateVideoTab("original");
     }
   }
@@ -646,24 +583,33 @@
   // ─── Image Upload ───────────────────────────────────────────
   function setupDropZone() {
     dropZone.addEventListener("click", () => fileInput.click());
+
     dropZone.addEventListener("dragover", (e) => {
       e.preventDefault();
       dropZone.classList.add("drag-over");
     });
-    dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over"));
+    dropZone.addEventListener("dragleave", () => {
+      dropZone.classList.remove("drag-over");
+    });
     dropZone.addEventListener("drop", (e) => {
       e.preventDefault();
       dropZone.classList.remove("drag-over");
-      if (e.dataTransfer.files.length > 0) uploadFile(e.dataTransfer.files[0]);
+      if (e.dataTransfer.files.length > 0) {
+        uploadFile(e.dataTransfer.files[0]);
+      }
     });
+
     fileInput.addEventListener("change", () => {
-      if (fileInput.files.length > 0) uploadFile(fileInput.files[0]);
+      if (fileInput.files.length > 0) {
+        uploadFile(fileInput.files[0]);
+      }
     });
   }
 
   async function uploadFile(file) {
     const fd = new FormData();
     fd.append("image", file);
+
     try {
       const r = await fetch("/api/upload", { method: "POST", body: fd });
       const d = await r.json();
@@ -684,52 +630,62 @@
   // ─── Clone session ─────────────────────────────────────────
   async function cloneSession() {
     if (!currentSessionId) return;
+
     try {
       const r = await fetch(`/api/sessions/${currentSessionId}/clone`, { method: "POST" });
       const d = await r.json();
-      if (d.error) { toast("Clone failed: " + d.error, "error"); return; }
-
-      // Helper to set both range + number
-      function setParam(id, val) {
-        const range = $(`#${id}`);
-        const num = $(`#${id}-num`);
-        if (range) range.value = val;
-        if (num) num.value = val;
+      if (d.error) {
+        toast("Clone failed: " + d.error, "error");
+        return;
       }
 
+      // Fill the generate form with cloned params
       $("#prompt").value = d.prompt || "";
       $("#negative-prompt").value = d.negative_prompt || "";
-      setParam("width", d.width || 832);
-      setParam("height", d.height || 480);
-      setParam("duration", d.duration || 5.0);
-      setParam("fps", d.fps || 16);
-      setParam("steps", d.num_inference_steps || 8);
-      setParam("cfg", d.guidance_scale || 2.0);
-      setParam("cfg2", d.guidance_scale_2 || 2.0);
-      setParam("flow-shift", d.flow_shift || 8.0);
-      setParam("output-fps", d.output_fps || 24);
-      setParam("boundary-ratio", d.boundary_ratio || 0.5);
+
+      // Update sliders + their value labels
+      function setSlider(id, val) {
+        const el = $(`#${id}`);
+        if (el) el.value = val;
+        const label = $(`#${id}-val`);
+        if (label) label.textContent = val;
+      }
+      setSlider("width", d.width || 832);
+      setSlider("height", d.height || 480);
+      setSlider("duration", d.duration || 5.0);
+      setSlider("fps", d.fps || 16);
+      setSlider("steps", d.num_inference_steps || 8);
+      setSlider("cfg", d.guidance_scale || 2.0);
+      setSlider("cfg2", d.guidance_scale_2 || 2.0);
+      setSlider("flow-shift", d.flow_shift || 8.0);
+      setSlider("output-fps", d.output_fps || 24);
       $("#seed").value = d.seed || 42;
       $("#enable-upscale").checked = d.enable_upscale || false;
 
+      // Update computed values
       updateFramesFromDuration();
       updateInterpHint();
-      updateMegapixels();
-      updateTotalSteps();
 
+      // Update LoRA scales
       if (d.lora_scales && d.lora_scales.length) {
-        const loraRanges = $$(".lora-scale");
-        const loraNums = $$(".lora-scale-num");
+        const loraInputs = $$(".lora-scale");
         d.lora_scales.forEach((val, i) => {
-          if (loraRanges[i]) loraRanges[i].value = val;
-          if (loraNums[i]) loraNums[i].value = val;
+          if (loraInputs[i]) {
+            loraInputs[i].value = val;
+            const valSpan = loraInputs[i].parentElement.querySelector(".lora-val");
+            if (valSpan) valSpan.textContent = val;
+          }
         });
       }
 
+      // If there's an input image URL, show it
       if (d.input_image_url) {
         previewImg.src = d.input_image_url;
         previewImg.style.display = "block";
         dropText.style.display = "none";
+        // Note: input_image_path needs to be set from the original session
+        // For clone, we keep the path empty — user needs to re-upload or
+        // we copy the image from the session
         $("#input-image-path").value = "";
         toast("Parameters cloned — please upload/confirm input image", "info", 5000);
       }
@@ -743,39 +699,33 @@
 
   // ─── Generate ───────────────────────────────────────────────
   function gatherParams() {
-    const loraRanges = $$(".lora-scale");
+    const loraInputs = $$(".lora-scale");
     const loraScales = [];
-    loraRanges.forEach(inp => loraScales.push(parseFloat(inp.value) || 0));
+    loraInputs.forEach(inp => {
+      loraScales.push(parseFloat(inp.value) || 0);
+    });
 
     const duration = parseFloat($("#duration").value) || 5;
     const fps = parseInt($("#fps").value) || 16;
     const numFrames = calcFrames4k1(duration, fps);
 
     return {
-      prompt:              $("#prompt").value,
-      negative_prompt:     $("#negative-prompt").value,
-      input_image:         $("#input-image-path").value,
-      width:               parseInt($("#width").value),
-      height:              parseInt($("#height").value),
-      num_frames:          numFrames,
-      fps:                 fps,
-      duration:            duration,
-      output_fps:          parseInt($("#output-fps").value) || fps,
+      prompt: $("#prompt").value,
+      negative_prompt: $("#negative-prompt").value,
+      input_image: $("#input-image-path").value,
+      width: parseInt($("#width").value),
+      height: parseInt($("#height").value),
+      num_frames: numFrames,
+      fps: fps,
+      duration: duration,
+      output_fps: parseInt($("#output-fps").value) || fps,
       num_inference_steps: parseInt($("#steps").value),
-      guidance_scale:      parseFloat($("#cfg").value),
-      guidance_scale_2:    parseFloat($("#cfg2").value),
-      flow_shift:          parseFloat($("#flow-shift").value),
-      boundary_ratio:      parseFloat($("#boundary-ratio").value),
-      seed:                parseInt($("#seed").value),
-      enable_upscale:      $("#enable-upscale").checked,
-      lora_scales:         loraScales,
-      // Memory settings
-      offload_type:        $("#offload-type") ? $("#offload-type").value : "block_level",
-      num_blocks_per_group: parseInt($("#num-blocks-per-group")?.value) || 1,
-      enable_group_offload: $("#enable-group-offload")?.checked ?? true,
-      vae_tiling:          $("#vae-tiling")?.checked ?? true,
-      vae_slicing:         $("#vae-slicing")?.checked ?? true,
-      force_vae_cpu:       $("#force-vae-cpu")?.checked ?? false,
+      guidance_scale: parseFloat($("#cfg").value),
+      guidance_scale_2: parseFloat($("#cfg2").value),
+      flow_shift: parseFloat($("#flow-shift").value),
+      seed: parseInt($("#seed").value),
+      enable_upscale: $("#enable-upscale").checked,
+      lora_scales: loraScales,
     };
   }
 
@@ -791,6 +741,7 @@
     }
 
     btnGenerate.disabled = true;
+
     try {
       const r = await fetch("/api/generate", {
         method: "POST",
@@ -806,13 +757,14 @@
 
       toast("Generation started!", "info");
       stepProgressData = {};
+
+      // Switch to session view
       currentSessionId = d.session_id;
       await refreshSessions();
       showSession(d.session_id);
       startTimer();
       startAutoRefresh();
       startLogPolling();
-      startSessionLogPolling();
     } catch (e) {
       toast("Request failed: " + e.message, "error");
       btnGenerate.disabled = false;
@@ -821,13 +773,18 @@
 
   async function resumeFromStep(step) {
     if (!currentSessionId) return;
+
+    // Confirmation before overwrite — warn about downstream checkpoints
     const stepOrder = ["encode", "denoise", "vae_decode", "export", "upscale"];
     const stepIdx = stepOrder.indexOf(step);
     const downstreamSteps = stepOrder.slice(stepIdx).join(", ");
     const confirmed = confirm(
-      `Resume from "${step}"?\n\nThis will re-run: ${downstreamSteps}\nAny existing checkpoints for these steps will be overwritten.`
+      `Resume from "${step}"?\n\n` +
+      `This will re-run: ${downstreamSteps}\n` +
+      `Any existing checkpoints for these steps will be overwritten.`
     );
     if (!confirmed) return;
+
     try {
       const r = await fetch(`/api/resume/${currentSessionId}`, {
         method: "POST",
@@ -835,14 +792,16 @@
         body: JSON.stringify({ from_step: step }),
       });
       const d = await r.json();
-      if (d.error) { toast("Error: " + d.error, "error"); return; }
+      if (d.error) {
+        toast("Error: " + d.error, "error");
+        return;
+      }
       toast(`Resuming from ${step}…`, "info");
       stepProgressData = {};
       btnCancel.style.display = "inline-flex";
       startTimer();
       startAutoRefresh();
       startLogPolling();
-      startSessionLogPolling();
       showSession(currentSessionId);
     } catch (e) {
       toast("Resume failed: " + e.message, "error");
@@ -850,13 +809,18 @@
   }
 
   async function cancelGeneration() {
-    try { await fetch("/api/cancel", { method: "POST" }); toast("Cancel requested…", "warning"); }
-    catch (e) { console.error(e); }
+    try {
+      await fetch("/api/cancel", { method: "POST" });
+      toast("Cancel requested…", "warning");
+    } catch (e) {
+      console.error(e);
+    }
   }
 
   async function deleteSession() {
     if (!currentSessionId) return;
     if (!confirm("Delete this session and all its files?")) return;
+
     try {
       await fetch(`/api/sessions/${currentSessionId}`, { method: "DELETE" });
       toast("Session deleted", "info");
@@ -875,29 +839,32 @@
     currentSessionId = null;
     stopAutoRefresh();
     stopLogPolling();
-    stopSessionLogPolling();
     stopTimer();
     renderSessionList();
-    const logSec = $("#session-logs-section");
-    if (logSec) logSec.style.display = "none";
   }
 
   // ─── Keyboard shortcuts ─────────────────────────────────────
   function setupKeyboardShortcuts() {
     document.addEventListener("keydown", (e) => {
+      // Don't trigger shortcuts when typing in inputs
       const tag = e.target.tagName.toLowerCase();
       const isInput = tag === "input" || tag === "textarea" || tag === "select";
 
+      // Enter to generate (only when generate panel is visible and not in input)
       if (e.key === "Enter" && !isInput && panelGen.style.display !== "none") {
         e.preventDefault();
         startGeneration();
         return;
       }
+
+      // Escape to cancel
       if (e.key === "Escape") {
         e.preventDefault();
         cancelGeneration();
         return;
       }
+
+      // Ctrl+N to show new generation panel
       if (e.ctrlKey && e.key === "n") {
         e.preventDefault();
         showGeneratePanel();
@@ -912,10 +879,15 @@
       if (e.target.classList.contains("video-tab")) {
         const tab = e.target.getAttribute("data-tab");
         activateVideoTab(tab);
+
+        // Sync playback for comparison
         if (tab === "compare") {
           const orig = $("#video-compare-orig");
           const up = $("#video-compare-up");
-          if (orig && up) { orig.currentTime = 0; up.currentTime = 0; }
+          if (orig && up) {
+            orig.currentTime = 0;
+            up.currentTime = 0;
+          }
         }
       }
     });
@@ -933,16 +905,9 @@
     initTheme();
     connectSSE();
     setupDropZone();
-    setupHybridInputs();
+    setupSliders();
     setupKeyboardShortcuts();
     setupVideoTabs();
-    setupSessionLogTabs();
-
-    // Initialize computed values
-    updateFramesFromDuration();
-    updateInterpHint();
-    updateMegapixels();
-    updateTotalSteps();
 
     btnNew.addEventListener("click", showGeneratePanel);
     btnGenerate.addEventListener("click", startGeneration);
@@ -952,6 +917,7 @@
     btnClone.addEventListener("click", cloneSession);
     btnTheme.addEventListener("click", toggleTheme);
 
+    // Resume buttons
     $$(".btn-resume").forEach(btn => {
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -959,11 +925,15 @@
       });
     });
 
+    // Poll VRAM every 10s
     pollVRAM();
     setInterval(pollVRAM, 10000);
+
+    // Load sessions immediately, then refresh every 15s
     refreshSessions();
     setInterval(refreshSessions, 15000);
 
+    // Check if there's an active generation and auto-show it
     fetch("/api/active").then(r => r.json()).then(d => {
       if (d.running && d.session_id) {
         currentSessionId = d.session_id;

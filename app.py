@@ -228,6 +228,17 @@ def api_generate():
             "output_fps": int(data.get("output_fps", config.get("output_fps", 24))),
             "enable_upscale": data.get("enable_upscale", False),
             "lora_scales": data.get("lora_scales", []),
+            "boundary_ratio": float(data.get("boundary_ratio", config.get("boundary_ratio", 0.5))),
+        }
+
+        # Memory / performance overrides — apply to engine cfg
+        memory_overrides = {
+            "offload_type": data.get("offload_type", config.get("offload_type", "block_level")),
+            "num_blocks_per_group": int(data.get("num_blocks_per_group", config.get("num_blocks_per_group", 1))),
+            "enable_group_offload": data.get("enable_group_offload", config.get("enable_group_offload", True)),
+            "vae_tiling": data.get("vae_tiling", config.get("vae_tiling", True)),
+            "vae_slicing": data.get("vae_slicing", config.get("vae_slicing", True)),
+            "force_vae_cpu": data.get("force_vae_cpu", config.get("force_vae_cpu", False)),
         }
 
         # Validate input image
@@ -246,6 +257,11 @@ def api_generate():
         # Run in background thread
         eng = get_engine()
         eng.set_progress_callback(progress_callback)
+
+        # Apply per-generation memory/performance overrides to engine config
+        for k, v in memory_overrides.items():
+            eng.cfg[k] = v
+        eng.cfg["boundary_ratio"] = params["boundary_ratio"]
 
         def run():
             global active_thread, active_session_id
@@ -417,6 +433,7 @@ def api_clone_session(session_id):
         "output_fps": d.get("output_fps", 24),
         "enable_upscale": d.get("enable_upscale", False),
         "lora_scales": d.get("lora_scales", []),
+        "boundary_ratio": d.get("boundary_ratio", 0.5),
         # input image served from session dir
         "input_image_url": f"/sessions/{session_id}/input.png"
                           if (sm.session_dir(session_id) / "input.png").exists() else "",
@@ -476,6 +493,34 @@ def serve_session_file(session_id, filename):
 @app.route("/input/<filename>")
 def serve_input(filename):
     return send_from_directory(str(UPLOAD_DIR), filename)
+
+
+@app.route("/api/sessions/<session_id>/generation_log", methods=["GET"])
+def api_generation_log(session_id):
+    """Return the generation.log file content for a session."""
+    sdir = sm.session_dir(session_id)
+    log_path = sdir / "generation.log"
+    if not log_path.exists():
+        return jsonify({"content": "(no generation log yet)", "exists": False})
+    try:
+        content = log_path.read_text(errors="replace")
+        return jsonify({"content": content, "exists": True})
+    except Exception as e:
+        return jsonify({"content": f"Error reading log: {e}", "exists": False})
+
+
+@app.route("/api/sessions/<session_id>/vram_log", methods=["GET"])
+def api_vram_log(session_id):
+    """Return the vram.log file content for a session."""
+    sdir = sm.session_dir(session_id)
+    log_path = sdir / "vram.log"
+    if not log_path.exists():
+        return jsonify({"content": "(no VRAM log yet)", "exists": False})
+    try:
+        content = log_path.read_text(errors="replace")
+        return jsonify({"content": content, "exists": True})
+    except Exception as e:
+        return jsonify({"content": f"Error reading log: {e}", "exists": False})
 
 
 # ─── Main ──────────────────────────────────────────────────────────
