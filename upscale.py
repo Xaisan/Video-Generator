@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """
-Post-generation upscale pipeline:
-  1. RIFE frame interpolation — increase framerate (e.g. 16fps → 24fps)
-  2. Spatial 4× upscale — via spandrel (ESRGAN/NMKD model)
+Post-generation upscale pipeline (professional order):
+  1. Spatial 4× upscale — via spandrel (ESRGAN/DAT/SwinIR model)
+  2. RIFE frame interpolation — at high resolution for best motion quality
+
+Upscale-first-then-interpolate is the correct professional order:
+  - RIFE gets 4× more spatial detail to analyse motion
+  - Only real frames get upscaled (fewer tiles to process)
+  - RIFE is lightweight (21 MB) — running it at 4× resolution is fast
+
+Target duration support:
+  - If target_duration > source duration → slow-motion (more interpolated frames)
+  - If target_duration < source duration → speed-up (fewer frames)
+  - If target_duration == 0 → preserve original duration (standard fps conversion)
 
 Processes frame-by-frame with tiling to stay within VRAM budget.
 RIFE model is loaded/freed separately from the spatial upscale model.
@@ -30,7 +40,7 @@ def load_upscale_model(model_path: str, device: torch.device):
             scale = model.scale
         else:
             scale = 4
-        
+
         # spandrel wraps the actual model in model.model
         if hasattr(model, 'model'):
             arch_name = type(model.model).__name__
@@ -39,7 +49,7 @@ def load_upscale_model(model_path: str, device: torch.device):
             # Fallback if no .model attribute (e.g. if it's a bare module)
             arch_name = type(model).__name__
             num_params = sum(p.numel() for p in model.parameters()) / 1e6
-            
+
         print(f"  Loaded upscale model: {Path(model_path).name}")
         print(f"    Architecture: {arch_name}, Scale: {scale}×, Params: {num_params:.1f}M")
         return model, scale, arch_name
@@ -142,17 +152,20 @@ def _flush():
 def upscale_video(input_path: str, output_path: str, cfg: dict,
                   progress_fn=None):
     """
-    Full upscale pipeline:
+    Full upscale pipeline (professional order):
       1. Read input video frames
-      2. (Optional) RIFE frame interpolation to increase framerate
-      3. Spatial 4× upscale each frame
-      4. Write output video at the target fps
+      2. Spatial 4× upscale each frame (at source resolution — fewer frames)
+      3. RIFE frame interpolation at upscaled resolution (best motion quality)
+      4. Write output video
 
     Config keys used:
-      fps           — source generation fps (default 16)
-      output_fps    — desired output framerate (default = fps, no interpolation)
-      upscale_model — path to spatial upscale model
-      rife_model    — path to RIFE .pth (default: models/upscale_models/rife47.pth)
+      fps             — source generation fps (default 16)
+      output_fps      — desired output framerate (default = fps, no interpolation)
+      target_duration — desired final duration in seconds (0 = preserve original)
+                        > source duration: slow-motion effect
+                        < source duration: speed-up effect
+      upscale_model   — path to spatial upscale model
+      rife_model      — path to RIFE .pth (default: models/upscale_models/rife47.pth)
 
     progress_fn: optional callback(percent: int, msg: str) for UI updates
     """
@@ -167,59 +180,26 @@ def upscale_video(input_path: str, output_path: str, cfg: dict,
 
     source_fps = int(cfg.get("fps", 16))
     output_fps = int(cfg.get("output_fps", source_fps))
+    target_duration = float(cfg.get("target_duration", 0))
 
-    # ── Phase 1: RIFE frame interpolation ──
-    if output_fps > source_fps:
-        rife_path = cfg.get("rife_model", "models/upscale_models/rife47.pth")
-        if os.path.isfile(rife_path):
-            print(f"  🎞  Frame interpolation: {source_fps}fps → {output_fps}fps using RIFE")
-            if progress_fn:
-                progress_fn(5, f"RIFE interpolation: {source_fps}→{output_fps}fps…")
-            from rife_model import load_rife_model, interpolate_sequence
+    n_src = len(frames)
+    source_duration = (n_src - 1) / source_fps if n_src > 1 else 0
+    print(f"  📹 Source: {n_src} frames @ {source_fps}fps = {source_duration:.2f}s")
 
-            rife = load_rife_model(rife_path, device)
-            if rife is not None:
-                def rife_progress(cur, total):
-                    if cur % 10 == 0 or cur == total:
-                        print(f"    RIFE interpolation: {cur}/{total} frames")
-                    if progress_fn:
-                        pct = 5 + int(25 * cur / total)
-                        progress_fn(pct, f"RIFE: {cur}/{total} frames")
-
-                frames = interpolate_sequence(
-                    rife, frames,
-                    target_fps=output_fps,
-                    source_fps=source_fps,
-                    device=device,
-                    progress_fn=rife_progress,
-                )
-                print(f"    RIFE done: {len(frames)} frames @ {output_fps}fps")
-
-                # Free RIFE model before spatial upscale
-                del rife
-                _flush()
-            else:
-                print("  ⚠  RIFE model failed to load, skipping frame interpolation")
-                output_fps = source_fps
-        else:
-            print(f"  ⚠  RIFE model not found at {rife_path}, skipping frame interpolation")
-            output_fps = source_fps
-    else:
-        if output_fps < source_fps:
-            print(f"  ℹ  Output FPS ({output_fps}) ≤ source ({source_fps}), no interpolation")
-        output_fps = source_fps  # Don't reduce fps
-
-    # ── Phase 2: Spatial 4× upscale ──
+    # ══════════════════════════════════════════════════════════════
+    #  PHASE 1: Spatial 4× upscale (on original frames — fewer tiles)
+    # ══════════════════════════════════════════════════════════════
     model_path = cfg.get("upscale_model", "models/upscale_models/4xRealWebPhoto_v4_dat2.pth")
-    print(f"  🔍 Spatial upscale with {Path(model_path).name}")
+    print(f"  🔍 Phase 1: Spatial upscale with {Path(model_path).name}")
     if progress_fn:
-        progress_fn(35, f"Loading upscale model…")
+        progress_fn(2, "Loading upscale model…")
     model, scale, arch_name = load_upscale_model(model_path, device)
     tile_size, tile_pad = _choose_tile_size(arch_name)
     print(f"    Tile size: {tile_size}px, pad: {tile_pad}px (arch: {arch_name})")
+    print(f"    Upscaling {n_src} frames (source resolution)")
 
     upscaled = []
-    total = len(frames)
+    total = n_src
     for i, frame in enumerate(frames):
         up = upscale_frame(model, frame, device,
                            tile_size=tile_size, tile_pad=tile_pad)
@@ -227,15 +207,96 @@ def upscale_video(input_path: str, output_path: str, cfg: dict,
         if (i + 1) % 5 == 0 or (i + 1) == total:
             print(f"    Spatial upscale: frame {i+1}/{total}")
         if progress_fn:
-            pct = 35 + int(60 * (i + 1) / total)
+            pct = 2 + int(58 * (i + 1) / total)
             progress_fn(pct, f"Spatial {scale}×: {i+1}/{total} frames")
 
-    # Free spatial model
-    del model
+    # Free spatial model before RIFE
+    del model, frames
     _flush()
+
+    src_h, src_w = upscaled[0].shape[:2] if upscaled else (0, 0)
+    print(f"    ✓ Upscale done: {src_w}×{src_h} ({scale}×)")
+
+    # ══════════════════════════════════════════════════════════════
+    #  PHASE 2: RIFE frame interpolation (at upscaled resolution)
+    # ══════════════════════════════════════════════════════════════
+    #
+    # RIFE runs on the high-res upscaled frames, giving it 4× more
+    # spatial detail for motion estimation → much better quality.
+    #
+    # Target duration logic:
+    #   - Compute how many output frames we need
+    #   - RIFE time-accurately resamples to produce exactly that many frames
+    #   - target_duration == 0 or matches source → standard fps conversion
+    #   - target_duration > source → slow motion (more interp frames)
+    #   - target_duration < source → speed up (subsample frames)
+
+    need_rife = False
+    effective_target_duration = target_duration if target_duration > 0 else source_duration
+
+    if target_duration > 0 and abs(target_duration - source_duration) > 0.05:
+        # Duration change requested
+        need_rife = True
+        speed_factor = source_duration / target_duration
+        print(f"  🎞  Phase 2: Duration retiming {source_duration:.2f}s → "
+              f"{target_duration:.2f}s @ {output_fps}fps")
+        if speed_factor > 1:
+            print(f"    Speed up: {speed_factor:.2f}× faster")
+        else:
+            print(f"    Slow motion: {1/speed_factor:.2f}× slower")
+    elif output_fps > source_fps:
+        # Standard fps upsampling
+        need_rife = True
+        print(f"  🎞  Phase 2: Frame interpolation {source_fps}fps → "
+              f"{output_fps}fps (duration preserved)")
+
+    if need_rife:
+        rife_path = cfg.get("rife_model", "models/upscale_models/rife47.pth")
+        if os.path.isfile(rife_path):
+            if progress_fn:
+                progress_fn(62, "Loading RIFE model…")
+            from rife_model import load_rife_model, interpolate_frame
+
+            rife = load_rife_model(rife_path, device)
+            if rife is not None:
+                # Calculate target frame count
+                n_target = round(effective_target_duration * output_fps) + 1
+
+                def rife_progress(cur, total):
+                    if cur % 10 == 0 or cur == total:
+                        print(f"    RIFE interpolation: {cur}/{total} frames")
+                    if progress_fn:
+                        pct = 62 + int(30 * cur / total)
+                        progress_fn(pct, f"RIFE: {cur}/{total} frames")
+
+                upscaled = _interpolate_to_count(
+                    rife, upscaled,
+                    n_target=n_target,
+                    device=device,
+                    progress_fn=rife_progress,
+                )
+                final_dur = (len(upscaled) - 1) / output_fps if len(upscaled) > 1 else 0
+                print(f"    RIFE done: {len(upscaled)} frames @ {output_fps}fps "
+                      f"= {final_dur:.2f}s")
+
+                del rife
+                _flush()
+            else:
+                print("  ⚠  RIFE model failed to load, skipping interpolation")
+                output_fps = source_fps
+        else:
+            print(f"  ⚠  RIFE model not found at {rife_path}, skipping")
+            output_fps = source_fps
+    else:
+        if output_fps <= source_fps:
+            output_fps = source_fps
+        print(f"  ℹ  No interpolation needed ({source_fps}fps, "
+              f"duration={source_duration:.2f}s)")
 
     # ── Write output ──
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    if progress_fn:
+        progress_fn(94, "Encoding final video…")
 
     import imageio
     h, w = upscaled[0].shape[:2]
@@ -248,17 +309,68 @@ def upscale_video(input_path: str, output_path: str, cfg: dict,
     writer.close()
 
     # Report
-    src_h, src_w = frames[0].shape[:2] if frames else (0, 0)
+    final_duration = (len(upscaled) - 1) / output_fps if len(upscaled) > 1 else 0
     print(f"  ✅ Upscaled video: {output_path}")
-    print(f"     {src_w}×{src_h} → {w}×{h} ({scale}× spatial)")
-    print(f"     {output_fps}fps, {len(upscaled)} frames, "
-          f"duration={(len(upscaled))/output_fps:.2f}s")
+    print(f"     {src_w}×{src_h} ({scale}× spatial)")
+    print(f"     {output_fps}fps, {len(upscaled)} frames")
+    print(f"     Duration: {source_duration:.2f}s → {final_duration:.2f}s")
+    if target_duration > 0 and abs(target_duration - source_duration) > 0.05:
+        speed = source_duration / final_duration if final_duration > 0 else 1
+        print(f"     Speed: {speed:.2f}× ({'faster' if speed > 1 else 'slower'})")
+
+
+def _interpolate_to_count(model, frames, n_target, device, progress_fn=None):
+    """
+    Interpolate/resample a frame sequence to produce exactly n_target frames.
+
+    Generalised time-accurate resampling:
+      - Speed-up (n_target < n_source): subsamples + interpolates precisely
+      - Slow-motion (n_target > n_source): creates many interpolated frames
+      - Standard fps conversion: works via time-position mapping
+
+    Each output frame is placed at its exact time position, and we
+    interpolate between the two nearest source frames using RIFE.
+    """
+    from rife_model import interpolate_frame
+
+    n_src = len(frames)
+    if n_src < 2 or n_target < 2:
+        return frames
+
+    result = []
+    total_interp = 0
+
+    for i in range(n_target):
+        # Map output frame index to source frame position
+        src_pos = i * (n_src - 1) / (n_target - 1)
+        src_lo = int(src_pos)
+        src_hi = min(src_lo + 1, n_src - 1)
+        blend = src_pos - src_lo
+
+        if blend < 0.001 or src_lo == src_hi:
+            result.append(frames[min(src_lo, n_src - 1)])
+        elif blend > 0.999:
+            result.append(frames[src_hi])
+        else:
+            mid = interpolate_frame(model, frames[src_lo], frames[src_hi],
+                                    blend, device)
+            result.append(mid)
+            total_interp += 1
+
+        if progress_fn and ((i + 1) % 10 == 0 or (i + 1) == n_target):
+            progress_fn(i + 1, n_target)
+
+    print(f"    Resampled {n_src} → {len(result)} frames "
+          f"({total_interp} interpolated, {len(result) - total_interp} original)")
+    return result
 
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 3:
-        print("Usage: python upscale.py input.mp4 output.mp4 [output_fps]")
+        print("Usage: python upscale.py input.mp4 output.mp4 [output_fps] [target_duration]")
         sys.exit(1)
     out_fps = int(sys.argv[3]) if len(sys.argv) > 3 else 16
-    upscale_video(sys.argv[1], sys.argv[2], {"output_fps": out_fps})
+    tgt_dur = float(sys.argv[4]) if len(sys.argv) > 4 else 0
+    upscale_video(sys.argv[1], sys.argv[2],
+                  {"output_fps": out_fps, "target_duration": tgt_dur})

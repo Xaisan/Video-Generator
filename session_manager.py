@@ -63,6 +63,7 @@ class SessionInfo:
     fps: int = 16
     duration: float = 5.0          # Video length in seconds
     output_fps: int = 24           # Output framerate after RIFE interpolation
+    target_duration: float = 0     # Target video duration in seconds (0 = preserve original)
     enable_upscale: bool = False
     upscale_model: str = "models/upscale_models/4xRealWebPhoto_v4_dat2.pth"
     boundary_ratio: float = 0.9    # High/low noise boundary split (official model default)
@@ -135,6 +136,7 @@ class SessionManager:
             fps=int(params.get("fps", 16)),
             duration=float(params.get("duration", 5.0)),
             output_fps=int(params.get("output_fps", 24)),
+            target_duration=float(params.get("target_duration", 0)),
             enable_upscale=bool(params.get("enable_upscale", False)),
             upscale_model=params.get("upscale_model", "models/upscale_models/4xRealWebPhoto_v4_dat2.pth"),
             boundary_ratio=float(params.get("boundary_ratio", 0.9)),

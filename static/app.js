@@ -50,6 +50,7 @@
     ["flow-shift",         "flow-shift-num"],
     ["boundary-ratio",     "boundary-ratio-num"],
     ["num-blocks-per-group","num-blocks-per-group-num"],
+    ["target-duration",    "target-duration-num"],
   ];
 
   function setupHybridInputs() {
@@ -117,8 +118,9 @@
   function onParamChange(id) {
     if (id === "duration" || id === "fps") updateFramesFromDuration();
     if (id === "fps" || id === "output-fps") updateInterpHint();
-    if (id === "width" || id === "height") updateMegapixels();
+    if (id === "width" || id === "height") { updateMegapixels(); updateResDimLabel(); }
     if (id === "steps") updateTotalSteps();
+    if (id === "target-duration" || id === "duration" || id === "fps") updateTargetDurationHint();
   }
 
   // ─── Computed values ────────────────────────────────────────
@@ -142,15 +144,56 @@
   function updateInterpHint() {
     const fps = parseInt($("#fps").value) || 16;
     const outputFps = parseInt($("#output-fps").value) || fps;
+    const targetDur = parseFloat($("#target-duration")?.value) || 0;
     const hint = $("#interp-hint");
     if (!hint) return;
-    if (outputFps > fps) {
+
+    if (targetDur > 0) {
+      const duration = parseFloat($("#duration").value) || 5;
+      const sourceDur = (calcFrames4k1(duration, fps) - 1) / fps;
+      const speed = sourceDur / targetDur;
+      if (Math.abs(speed - 1) < 0.05) {
+        hint.textContent = `RIFE: ${fps}→${outputFps}fps`;
+        hint.style.color = "var(--success)";
+      } else if (speed > 1) {
+        hint.textContent = `RIFE: ${speed.toFixed(1)}× faster → ${targetDur}s`;
+        hint.style.color = "var(--warning, #d29922)";
+      } else {
+        hint.textContent = `RIFE: ${(1/speed).toFixed(1)}× slower → ${targetDur}s`;
+        hint.style.color = "var(--info, #58a6ff)";
+      }
+    } else if (outputFps > fps) {
       const ratio = Math.round(outputFps / fps);
       hint.textContent = `RIFE: ${fps}→${outputFps} (~${ratio}×)`;
       hint.style.color = "var(--success)";
     } else {
       hint.textContent = `No interp (${fps}fps)`;
       hint.style.color = "var(--text-muted)";
+    }
+  }
+
+  function updateTargetDurationHint() {
+    const hint = $("#target-duration-hint");
+    if (!hint) return;
+    const targetDur = parseFloat($("#target-duration")?.value) || 0;
+    if (targetDur <= 0) {
+      hint.textContent = "0 = keep original duration";
+      hint.style.color = "";
+      return;
+    }
+    const fps = parseInt($("#fps").value) || 16;
+    const duration = parseFloat($("#duration").value) || 5;
+    const sourceDur = (calcFrames4k1(duration, fps) - 1) / fps;
+    const speed = sourceDur / targetDur;
+    if (Math.abs(speed - 1) < 0.05) {
+      hint.textContent = `≈ original (${sourceDur.toFixed(1)}s)`;
+      hint.style.color = "";
+    } else if (speed > 1) {
+      hint.textContent = `${speed.toFixed(2)}× speed up (${sourceDur.toFixed(1)}s → ${targetDur}s)`;
+      hint.style.color = "var(--warning, #d29922)";
+    } else {
+      hint.textContent = `${(1/speed).toFixed(2)}× slow motion (${sourceDur.toFixed(1)}s → ${targetDur}s)`;
+      hint.style.color = "var(--info, #58a6ff)";
     }
   }
 
@@ -567,13 +610,23 @@
         if (uSelect && document.activeElement !== uSelect) {
             uSelect.value = s.upscale_model;
         }
+        // Also populate fps and duration controls from session
+        const fpsInput = card.querySelector(".upscale-step-fps");
+        if (fpsInput && document.activeElement !== fpsInput) {
+          fpsInput.value = s.output_fps || 24;
+        }
+        const durInput = card.querySelector(".upscale-step-duration");
+        if (durInput && document.activeElement !== durInput) {
+          durInput.value = s.target_duration || 0;
+        }
       }
     });
 
     $("#info-prompt").textContent = s.prompt || "—";
     const durStr = s.duration ? `${s.duration}s` : "";
     const outFpsStr = s.output_fps && s.output_fps !== s.fps ? ` → ${s.output_fps}fps` : "";
-    $("#info-size").textContent = `${s.width}×${s.height}, ${s.num_frames}f ${durStr} @ ${s.fps}fps${outFpsStr}`;
+    const tgtDurStr = s.target_duration && s.target_duration > 0 ? ` (target: ${s.target_duration}s)` : "";
+    $("#info-size").textContent = `${s.width}×${s.height}, ${s.num_frames}f ${durStr} @ ${s.fps}fps${outFpsStr}${tgtDurStr}`;
     const modeStr = s.distill_lora_mode ? "⚡ Fast" : "🎨 Quality";
     $("#info-steps").textContent = `${s.num_inference_steps} (${modeStr})`;
     $("#info-seed").textContent = s.seed;
@@ -690,6 +743,8 @@
         previewImg.style.display = "block";
         dropText.style.display = "none";
         toast("Image uploaded", "success", 2000);
+        // Auto-detect aspect ratio and adjust width/height
+        autoAdjustAspectRatio(`/input/${d.filename}`);
       } else {
         toast("Upload failed: " + (d.error || "unknown"), "error");
       }
@@ -697,6 +752,101 @@
       toast("Upload error: " + e.message, "error");
     }
   }
+
+  /**
+   * Auto-adjust width/height sliders to match the aspect ratio of the
+   * uploaded image, keeping dimensions as multiples of 16 within the
+   * allowed ranges (width: 256-1920, height: 256-1080).
+   */
+  function autoAdjustAspectRatio(imageUrl) {
+    const img = new Image();
+    img.onload = () => {
+      const iw = img.naturalWidth;
+      const ih = img.naturalHeight;
+      if (!iw || !ih) return;
+
+      const aspect = iw / ih;   // > 1 = landscape, < 1 = portrait
+
+      // Constraints
+      const MIN_W = 256, MAX_W = 1920;
+      const MIN_H = 256, MAX_H = 1080;
+      const STEP = 16;
+
+      // Strategy: try all valid widths (mod 16) and find matching height
+      // that best preserves aspect ratio while staying in range.
+      let bestW = 832, bestH = 480, bestErr = Infinity;
+
+      for (let w = MIN_W; w <= MAX_W; w += STEP) {
+        let h = Math.round(w / aspect / STEP) * STEP;
+        if (h < MIN_H) h = MIN_H;
+        if (h > MAX_H) h = MAX_H;
+        const err = Math.abs((w / h) - aspect);
+        if (err < bestErr) {
+          bestErr = err;
+          bestW = w;
+          bestH = h;
+        }
+      }
+
+      setParam("width", bestW);
+      setParam("height", bestH);
+      onParamChange("width");
+      onParamChange("height");
+      updateResDimLabel();
+      toast(`Aspect ratio detected (${iw}×${ih}) → ${bestW}×${bestH}`, "info", 3000);
+    };
+    img.src = imageUrl;
+  }
+
+  // ─── Resolution scaling ─────────────────────────────────────
+  /**
+   * Scale width & height by a percentage while preserving aspect ratio.
+   * Snaps to multiples of 16 and clamps within the allowed ranges.
+   */
+  function scaleResolution(pct) {
+    const curW = parseInt($("#width").value) || 832;
+    const curH = parseInt($("#height").value) || 480;
+    const factor = 1 + pct / 100;
+
+    const MIN_W = 256, MAX_W = 1920;
+    const MIN_H = 256, MAX_H = 1080;
+    const STEP = 16;
+
+    let newW = Math.round(curW * factor / STEP) * STEP;
+    let newH = Math.round(curH * factor / STEP) * STEP;
+
+    // Clamp
+    newW = Math.max(MIN_W, Math.min(MAX_W, newW));
+    newH = Math.max(MIN_H, Math.min(MAX_H, newH));
+
+    // If one dimension hit the clamp, adjust the other to preserve aspect ratio
+    const aspect = curW / curH;
+    if (newW === MIN_W || newW === MAX_W) {
+      newH = Math.round(newW / aspect / STEP) * STEP;
+      newH = Math.max(MIN_H, Math.min(MAX_H, newH));
+    } else if (newH === MIN_H || newH === MAX_H) {
+      newW = Math.round(newH * aspect / STEP) * STEP;
+      newW = Math.max(MIN_W, Math.min(MAX_W, newW));
+    }
+
+    setParam("width", newW);
+    setParam("height", newH);
+    onParamChange("width");
+    onParamChange("height");
+    updateResDimLabel();
+  }
+
+  function updateResDimLabel() {
+    const el = $("#res-scale-dim");
+    if (el) el.textContent = `${$("#width").value}×${$("#height").value}`;
+  }
+
+  // Bind scale buttons
+  document.querySelectorAll(".res-scale-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      scaleResolution(parseInt(btn.dataset.scale));
+    });
+  });
 
   // ─── Clone session ─────────────────────────────────────────
   async function cloneSession() {
@@ -717,6 +867,7 @@
       setParam("cfg2", d.guidance_scale_2 || 5.0);
       setParam("flow-shift", d.flow_shift || 8.0);
       setParam("output-fps", d.output_fps || 24);
+      setParam("target-duration", d.target_duration || 0);
       setParam("boundary-ratio", d.boundary_ratio || 0.9);
       $("#seed").value = d.seed || 42;
       $("#enable-upscale").checked = d.enable_upscale || false;
@@ -731,6 +882,7 @@
       updateInterpHint();
       updateMegapixels();
       updateTotalSteps();
+      updateTargetDurationHint();
 
       if (d.lora_scales && d.lora_scales.length) {
         const loraRanges = $$(".lora-scale");
@@ -745,8 +897,11 @@
         previewImg.src = d.input_image_url;
         previewImg.style.display = "block";
         dropText.style.display = "none";
-        $("#input-image-path").value = "";
-        toast("Parameters cloned — please upload/confirm input image", "info", 5000);
+        // Use the original input_image path so validation passes
+        $("#input-image-path").value = d.input_image || "";
+        if (!d.input_image) {
+          toast("Parameters cloned — please upload/confirm input image", "info", 5000);
+        }
       }
 
       showGeneratePanel();
@@ -846,6 +1001,7 @@
       fps:                 fps,
       duration:            duration,
       output_fps:          parseInt($("#output-fps").value) || fps,
+      target_duration:     parseFloat($("#target-duration")?.value) || 0,
       num_inference_steps: parseInt($("#steps").value),
       guidance_scale:      parseFloat($("#cfg").value),
       guidance_scale_2:    parseFloat($("#cfg2").value),
@@ -940,6 +1096,22 @@
         payload.upscale_model = stepUpscaleSelect.value;
       } else if (mainUpscaleSelect) {
         payload.upscale_model = mainUpscaleSelect.value;
+      }
+
+      // Send output_fps and target_duration from step card controls if available
+      const stepFpsInput = $('.step-card[data-step="upscale"] .upscale-step-fps');
+      const stepDurInput = $('.step-card[data-step="upscale"] .upscale-step-duration');
+      
+      if (stepFpsInput) {
+        payload.output_fps = parseInt(stepFpsInput.value) || 24;
+      } else {
+        payload.output_fps = parseInt($("#output-fps")?.value) || 24;
+      }
+      
+      if (stepDurInput) {
+        payload.target_duration = parseFloat(stepDurInput.value) || 0;
+      } else {
+        payload.target_duration = parseFloat($("#target-duration")?.value) || 0;
       }
 
       const r = await fetch(`/api/resume/${currentSessionId}`, {
@@ -1057,6 +1229,7 @@
     updateInterpHint();
     updateMegapixels();
     updateTotalSteps();
+    updateTargetDurationHint();
 
     btnNew.addEventListener("click", showGeneratePanel);
     btnGenerate.addEventListener("click", startGeneration);

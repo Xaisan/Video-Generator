@@ -1,7 +1,7 @@
 # ─── AMD ROCm PyTorch base ──────────────────────────────────────────
 FROM rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
-# Use gfx1100 for RX 7900 XTX (RDNA3)
-ENV HSA_OVERRIDE_GFX_VERSION=11.0.0
+# HSA_OVERRIDE_GFX_VERSION is set at runtime by amd_tune.py from config.yaml
+# (supports gfx1100/RDNA3, gfx1030/RDNA2, etc. without rebuilding the image)
 ENV HIP_VISIBLE_DEVICES=0
 # PyTorch 2.9+ uses PYTORCH_ALLOC_CONF (PYTORCH_HIP_ALLOC_CONF is deprecated)
 ENV PYTORCH_ALLOC_CONF=expandable_segments:True

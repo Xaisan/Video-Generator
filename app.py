@@ -239,6 +239,7 @@ def api_generate():
             "fps": int(data.get("fps", config.get("fps", 16))),
             "duration": float(data.get("duration", config.get("duration", 5.0))),
             "output_fps": int(data.get("output_fps", config.get("output_fps", 24))),
+            "target_duration": float(data.get("target_duration", config.get("target_duration", 0))),
             "enable_upscale": data.get("enable_upscale", False),
             "upscale_model": data.get("upscale_model", config.get("upscale_model", "models/upscale_models/4xRealWebPhoto_v4_dat2.pth")),
             "lora_scales": data.get("lora_scales", []),
@@ -264,6 +265,24 @@ def api_generate():
         # Snap dimensions to mod 16
         params["width"] = (params["width"] // 16) * 16
         params["height"] = (params["height"] // 16) * 16
+
+        # VRAM estimation guard — warn (but don't block) if settings
+        # are likely to OOM on the detected GPU.
+        try:
+            import torch
+            if torch.cuda.is_available():
+                total_vram_gb = torch.cuda.get_device_properties(0).total_mem / 1024**3
+                # Rough estimate: latent-shaped tensors dominate during denoise.
+                # latent size ≈ (W/8)*(H/8)*(F/4)*16 channels * 2 bytes (bf16)
+                # With CFG: ~3× that (latent + noise_pred_cond + noise_pred_uncond)
+                w, h, f = params["width"], params["height"], params["num_frames"]
+                latent_bytes = (w // 8) * (h // 8) * ((f - 1) // 4 + 1) * 16 * 2
+                peak_est_gb = (latent_bytes * 3 + 2 * 1024**3) / 1024**3  # +2 GB overhead
+                if peak_est_gb > total_vram_gb * 0.85:
+                    print(f"  ⚠ VRAM WARNING: {w}×{h}×{f}f estimated peak "
+                          f"{peak_est_gb:.1f} GB vs {total_vram_gb:.0f} GB total VRAM")
+        except Exception:
+            pass  # Non-critical — don't block generation
 
         # Create session
         session = sm.create_session(params)
@@ -346,6 +365,8 @@ def api_resume(session_id):
             info.upscale_model = data["upscale_model"]
         if "output_fps" in data:
             info.output_fps = int(data["output_fps"])
+        if "target_duration" in data:
+            info.target_duration = float(data["target_duration"])
         if "duration" in data:
             info.duration = float(data["duration"])
 
@@ -448,11 +469,13 @@ def api_clone_session(session_id):
         "fps": d.get("fps", 16),
         "duration": d.get("duration", 5.0),
         "output_fps": d.get("output_fps", 24),
+        "target_duration": d.get("target_duration", 0),
         "enable_upscale": d.get("enable_upscale", False),
         "upscale_model": d.get("upscale_model", ""),
         "lora_scales": d.get("lora_scales", []),
         "boundary_ratio": d.get("boundary_ratio", 0.5),
-        # input image served from session dir
+        # input image: absolute path + URL for display
+        "input_image": d.get("input_image", ""),
         "input_image_url": f"/sessions/{session_id}/input.png"
                           if (sm.session_dir(session_id) / "input.png").exists() else "",
     }
@@ -551,9 +574,31 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
+    # Apply AMD tuning from config BEFORE any CUDA calls
+    startup_cfg = get_cfg()
+    from amd_tune import apply_amd_optimisations, detect_amd_gpu
+    apply_amd_optimisations(startup_cfg)
+
     print("=" * 60)
     print("  Wan 2.2 I2V — Web UI")
     print(f"  http://localhost:{args.port}")
+
+    try:
+        gpu_info = detect_amd_gpu()
+        if gpu_info["available"]:
+            print(f"  GPU:   {gpu_info['device_name']}")
+            print(f"  VRAM:  {gpu_info['total_vram_gb']} GB")
+            print(f"  Arch:  {gpu_info['gfx_arch']}")
+            print(f"  HSA:   {os.environ.get('HSA_OVERRIDE_GFX_VERSION', 'not set')}")
+            vram_gb = gpu_info['total_vram_gb']
+            if vram_gb < 16:
+                print(f"  ⚠  Low VRAM ({vram_gb} GB) — ensure force_vae_cpu=true")
+                print(f"     Max safe resolution: 832×480 @ 81 frames")
+        else:
+            print("  ⚠  No GPU detected!")
+    except Exception as e:
+        print(f"  ⚠  GPU detection failed: {e}")
+
     print("=" * 60)
 
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)

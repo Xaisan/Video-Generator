@@ -18,7 +18,9 @@ def detect_amd_gpu() -> dict:
     info["available"] = True
     info["device_name"] = torch.cuda.get_device_name(0)
     props = torch.cuda.get_device_properties(0)
-    info["total_vram_gb"] = round(props.total_mem / 1024**3, 1)
+    # PyTorch 2.x uses 'total_memory', older versions may use 'total_mem'
+    total_mem = getattr(props, "total_memory", None) or getattr(props, "total_mem", 0)
+    info["total_vram_gb"] = round(total_mem / 1024**3, 1)
     info["hip_version"] = getattr(torch.version, "hip", "N/A")
     info["pytorch_version"] = torch.__version__
     info["bf16_support"] = torch.cuda.is_bf16_supported()

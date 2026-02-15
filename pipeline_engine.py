@@ -1089,11 +1089,17 @@ class PipelineEngine:
             if self._slog:
                 self._slog.vram_event("denoise", f"VAE loaded on {vae_device}")
 
-            # Load a temporary transformer ONLY to read config values
-            # (vae_scale_factor_spatial, z_dim, image_dim).  This loads
-            # to CPU/meta and is freed immediately — never touches GPU.
-            self._emit(session_id, "denoise", 6, "Reading model config…")
-            transformer_cfg_reader = load_single_transformer(cfg, "high")
+            # Model config constants for Wan2.2-I2V-A14B:
+            # These are fixed values from the HF config JSONs.  Previously we
+            # loaded a full 12 GB GGUF transformer just to read them — that
+            # wasted ~12 GB of system RAM and ~20s of I/O.
+            #   vae_scale_factor = 2^(len(dim_mult)-1) = 2^3 = 8
+            #   z_dim = 16  (from vae/config.json)
+            #   image_dim = None  (no CLIP cross-attn in this model variant)
+            vae_scale_factor = 8
+            num_channels_latents = vae.config.z_dim   # 16
+            image_dim = None   # checked: always None for Wan2.2-I2V-A14B GGUFs
+
             from transformers import AutoTokenizer
             tokenizer = AutoTokenizer.from_pretrained(
                 cfg["model_id"], subfolder="tokenizer"
@@ -1102,25 +1108,17 @@ class PipelineEngine:
             pipe_vae = WanImageToVideoPipeline(
                 tokenizer=tokenizer,
                 text_encoder=None,
-                transformer=transformer_cfg_reader,
+                transformer=None,
                 vae=vae,
                 scheduler=sched,
                 image_processor=None,
             )
 
-            vae_scale_factor = pipe_vae.vae_scale_factor_spatial
-            num_channels_latents = vae.config.z_dim
-            image_dim = transformer_cfg_reader.config.image_dim
-
-            # Free config reader immediately — never went to GPU
-            pipe_vae.transformer = None
-            transformer_cfg_reader.to("meta")
-            del transformer_cfg_reader
-            gc.collect()
-            print(f"  Config read done. VRAM: {vram_stats()}  RAM: {ram_stats()}")
+            print(f"  Model config: vae_scale_factor={vae_scale_factor}, "
+                  f"z_dim={num_channels_latents}, image_dim={image_dim}  "
+                  f"VRAM: {vram_stats()}  RAM: {ram_stats()}")
             if self._slog:
-                self._slog.log("denoise", f"vae_scale_factor={vae_scale_factor}, z_dim={num_channels_latents}, image_dim={image_dim}")
-                self._slog.vram_event("denoise", "config reader freed")
+                self._slog.log("denoise", f"vae_scale_factor={vae_scale_factor}, z_dim={num_channels_latents}, image_dim={image_dim} (hardcoded — no config reader load)")
 
             # Prepare image
             image = prepare_image(info.input_image, info.width, info.height)
@@ -1620,6 +1618,8 @@ class PipelineEngine:
 
         try:
             cfg = self.cfg
+            force_vae_cpu = cfg.get("force_vae_cpu", False)
+            vae_device = "cpu" if force_vae_cpu else "cuda"
             vae = load_vae(cfg)
 
             if cfg.get("vae_tiling", True):
@@ -1627,13 +1627,13 @@ class PipelineEngine:
             if cfg.get("vae_slicing", True):
                 vae.enable_slicing()
 
-            vae.to("cuda")
+            vae.to(vae_device)
             if self._slog:
-                self._slog.vram_event("vae_decode", "VAE loaded on GPU")
+                self._slog.vram_event("vae_decode", f"VAE loaded on {vae_device}")
 
             self._emit(session_id, "vae_decode", 20, "Loading latents…")
             latents = self.sm.load_checkpoint(session_id, "latents")
-            latents = latents.to("cuda", dtype=torch.float32)
+            latents = latents.to(vae_device, dtype=torch.float32)
             if self._slog:
                 self._slog.log_tensor("vae_decode", "latents", latents)
                 self._slog.vram_event("vae_decode", "latents loaded to GPU")
@@ -1655,7 +1655,18 @@ class PipelineEngine:
                     latents = latents / scaling
 
             with torch.no_grad():
-                frames_tensor = vae.decode(latents).sample
+                try:
+                    frames_tensor = vae.decode(latents).sample
+                except torch.OutOfMemoryError:
+                    if vae_device == "cuda":
+                        print("  ⚠ OOM during GPU VAE decode; retrying on CPU…",
+                              flush=True)
+                        flush_vram()
+                        vae.to("cpu")
+                        latents = latents.to("cpu")
+                        frames_tensor = vae.decode(latents).sample
+                    else:
+                        raise
 
             frames_tensor = frames_tensor.clamp(-1, 1)
             frames_tensor = ((frames_tensor + 1) / 2 * 255).to(torch.uint8)
@@ -1824,12 +1835,13 @@ class PipelineEngine:
             upscale_cfg = dict(self.cfg)
             upscale_cfg["fps"] = info.fps
             upscale_cfg["output_fps"] = getattr(info, "output_fps", info.fps)
+            upscale_cfg["target_duration"] = getattr(info, "target_duration", 0)
             # Use session-specific upscale model if set
             if hasattr(info, "upscale_model") and info.upscale_model:
                 upscale_cfg["upscale_model"] = info.upscale_model
             if self._slog:
                 self._slog.log("upscale", f"Input: {video_path}, Output: {up_path}")
-                self._slog.log("upscale", f"fps={info.fps}, output_fps={upscale_cfg['output_fps']}")
+                self._slog.log("upscale", f"fps={info.fps}, output_fps={upscale_cfg['output_fps']}, target_duration={upscale_cfg['target_duration']}")
                 self._slog.log("upscale", f"model={upscale_cfg.get('upscale_model', 'default')}")
 
             def upscale_progress(pct, msg):

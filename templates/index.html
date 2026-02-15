@@ -103,6 +103,16 @@
               </div>
             </div>
 
+            <!-- Resolution scaling buttons -->
+            <div class="res-scale-row">
+              <span class="res-scale-label">Scale</span>
+              <button type="button" class="res-scale-btn" data-scale="-25">−25%</button>
+              <button type="button" class="res-scale-btn" data-scale="-10">−10%</button>
+              <button type="button" class="res-scale-btn" data-scale="10">+10%</button>
+              <button type="button" class="res-scale-btn" data-scale="25">+25%</button>
+              <span class="res-scale-dim" id="res-scale-dim">832×480</span>
+            </div>
+
             <!-- Timing row -->
             <div class="param-row">
               <div class="param-item">
@@ -202,6 +212,14 @@
                   <option value="{{ m.path }}" {% if m.path == config.get('upscale_model', '') %}selected{% endif %}>{{ m.name }}</option>
                   {% endfor %}
                 </select>
+              </div>
+              <div class="param-item">
+                <label for="target-duration">Target Duration (s)</label>
+                <div class="hybrid-input">
+                  <input type="range" id="target-duration" value="0" min="0" max="30" step="0.5" />
+                  <input type="number" id="target-duration-num" value="0" min="0" max="60" step="0.5" class="param-number" />
+                </div>
+                <div class="computed-hint" id="target-duration-hint">0 = keep original duration</div>
               </div>
             </div>
 
@@ -321,11 +339,15 @@
             </div>
             <div class="step-time"></div>
             {% if step == 'upscale' %}
-            <select class="upscale-step-select" style="max-width:140px;height:24px;font-size:11px;padding:0 4px;margin-right:8px;background:var(--bg-card);color:var(--text-color);border:1px solid var(--border-color);border-radius:4px;">
+            <select class="upscale-step-select" style="max-width:140px;height:24px;font-size:11px;padding:0 4px;margin-right:4px;background:var(--bg-card);color:var(--text-color);border:1px solid var(--border-color);border-radius:4px;">
               {% for m in upscale_models %}
               <option value="{{ m.path }}">{{ m.name }}</option>
               {% endfor %}
             </select>
+            <label style="font-size:11px;margin-right:2px;" title="Output FPS for upscaled video">FPS</label>
+            <input type="number" class="upscale-step-fps" value="24" min="8" max="60" step="1" style="width:44px;height:24px;font-size:11px;padding:0 4px;margin-right:4px;background:var(--bg-card);color:var(--text-color);border:1px solid var(--border-color);border-radius:4px;text-align:center;" title="Output FPS" />
+            <label style="font-size:11px;margin-right:2px;" title="Target duration in seconds (0 = keep original)">Dur</label>
+            <input type="number" class="upscale-step-duration" value="0" min="0" max="60" step="0.5" style="width:50px;height:24px;font-size:11px;padding:0 4px;margin-right:4px;background:var(--bg-card);color:var(--text-color);border:1px solid var(--border-color);border-radius:4px;text-align:center;" title="Target duration (0 = original)" />
             {% endif %}
             <button class="btn btn-xs btn-ghost btn-resume" data-step="{{ step }}" title="Resume from this step">▶</button>
           </div>

@@ -9,8 +9,8 @@ model_id: "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
 # These are loaded via WanTransformer3DModel.from_single_file() with
 # GGUFQuantizationConfig.  Q6_K ≈ 10 GB each → fits in 24 GB VRAM
 # with group offloading.
-gguf_transformer_high: "models/unet/Wan2.2-I2V-A14B-HighNoise-Q6_K.gguf"
-gguf_transformer_low:  "models/unet/Wan2.2-I2V-A14B-LowNoise-Q6_K.gguf"
+gguf_transformer_high: "models/unet/Wan2.2-I2V-A14B-HighNoise-Q8_0.gguf"
+gguf_transformer_low:  "models/unet/Wan2.2-I2V-A14B-LowNoise-Q8_0.gguf"
 
 # ─── LoRA configuration ────────────────────────────────────────────
 # Each entry: path, target (transformer|transformer_2), adapter_name, scale, role.
@@ -35,7 +35,7 @@ loras:
   - path: "models/loras/Wan21_I2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors"
     target: "transformer"
     adapter_name: "lightx2v_high"
-    scale: 1.0
+    scale: 3.0
     role: "distill"
 
   - path: "models/loras/Wan21_I2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors"
@@ -95,7 +95,7 @@ loras:
   - path: "models/loras/s_t_LowNoise_merged3_7_v2.safetensors"
     target: "transformer_2"
     adapter_name: "st_low"
-    scale: 0.3
+    scale: 0.5
     role: "quality"
 
 # ─── Distill LoRA mode ─────────────────────────────────────────────
@@ -113,8 +113,8 @@ loras:
 distill_lora_mode: false
 
 # ─── Generation settings ───────────────────────────────────────────
-prompt: "A cat walking gracefully across a sunlit garden path, cinematic lighting, 4K quality"
-negative_prompt: "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
+prompt: ""
+negative_prompt: "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 
 input_image: "input/input.png"
 output_path: "output/video.mp4"
@@ -202,8 +202,20 @@ rife_model: "models/upscale_models/rife47.pth"
 #   4x_NMKD-Siax_200k.pth      — ESRGAN, 64MB, weak (legacy, not recommended)
 
 # ─── AMD-specific tuning ───────────────────────────────────────────
+# GPU profiles:
+#   7900 XTX (24 GB, gfx1100/RDNA3):  hsa=11.0.0, force_vae_cpu=false
+#   6800M (12 GB, gfx1031→gfx1030/RDNA2): hsa=10.3.0, force_vae_cpu=true
+#
+# For 12 GB GPUs, also set:
+#   force_vae_cpu: true           (VAE decode spikes ~6-10 GB → OOM)
+#   text_encoder_gpu_headroom_gb: 2.0  (more conservative GPU/CPU split)
+#   num_blocks_per_group: 1       (must stay at 1, no room for more)
+#   Max safe resolution: 832×480 @ 81 frames (~7-8 GB peak VRAM)
+#   Resolutions above ~0.5 MP will likely OOM during denoise.
 amd:
-  # Force gfx1100 ISA (7900 XTX)
+  # GFX ISA override — set to match YOUR GPU:
+  #   "11.0.0" = gfx1100 (RX 7900 XTX, RDNA3)
+  #   "10.3.0" = gfx1030 (RX 6800M/6800 XT, RDNA2)
   hsa_override_gfx_version: "11.0.0"
   # Expandable VRAM segments — avoids fragmentation OOMs
   pytorch_hip_alloc_conf: "expandable_segments:True"
