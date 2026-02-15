@@ -331,6 +331,10 @@ const Generate = (() => {
     Sessions.renderList();
     const logSec = $("#session-logs-section");
     if (logSec) logSec.style.display = "none";
+
+    // Set a random seed each time the generate panel opens
+    const seedEl = $("#seed");
+    if (seedEl) seedEl.value = Math.floor(Math.random() * 2147483647);
   }
 
   // ─── Keyboard Shortcuts ───────────────────────────────────────

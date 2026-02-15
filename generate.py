@@ -247,36 +247,28 @@ def build_pipeline(cfg: dict):
 
     t0 = time.time()
 
-    # ── Load GGUF quantized transformers ────────────────────────────
-    gguf_high = cfg.get("gguf_transformer_high")
-    gguf_low = cfg.get("gguf_transformer_low")
+    # ── Load transformers (GGUF or safetensors) ────────────────────
+    path_high = cfg.get("gguf_transformer_high")
+    path_low = cfg.get("gguf_transformer_low")
 
-    if not gguf_high or not os.path.isfile(gguf_high):
-        print(f"❌ High-noise GGUF not found: {gguf_high}")
+    if not path_high or not os.path.isfile(path_high):
+        print(f"❌ High-noise transformer not found: {path_high}")
         sys.exit(1)
-    if not gguf_low or not os.path.isfile(gguf_low):
-        print(f"❌ Low-noise GGUF not found: {gguf_low}")
+    if not path_low or not os.path.isfile(path_low):
+        print(f"❌ Low-noise transformer not found: {path_low}")
         sys.exit(1)
 
-    quant_config = GGUFQuantizationConfig(compute_dtype=dtype)
+    def _load_transformer(path, subfolder, label):
+        is_gguf = path.lower().endswith(".gguf")
+        fmt = "GGUF" if is_gguf else "safetensors"
+        print(f"   Loading {label} transformer ({fmt}): {os.path.basename(path)}")
+        kwargs = dict(config=model_id, subfolder=subfolder, torch_dtype=dtype)
+        if is_gguf:
+            kwargs["quantization_config"] = GGUFQuantizationConfig(compute_dtype=dtype)
+        return WanTransformer3DModel.from_single_file(path, **kwargs)
 
-    print(f"   Loading high-noise transformer: {os.path.basename(gguf_high)}")
-    transformer_high = WanTransformer3DModel.from_single_file(
-        gguf_high,
-        quantization_config=quant_config,
-        config=model_id,
-        subfolder="transformer",
-        torch_dtype=dtype,
-    )
-
-    print(f"   Loading low-noise transformer:  {os.path.basename(gguf_low)}")
-    transformer_low = WanTransformer3DModel.from_single_file(
-        gguf_low,
-        quantization_config=quant_config,
-        config=model_id,
-        subfolder="transformer_2",
-        torch_dtype=dtype,
-    )
+    transformer_high = _load_transformer(path_high, "transformer", "high-noise")
+    transformer_low = _load_transformer(path_low, "transformer_2", "low-noise")
 
     # ── VAE (float32 for decode quality) ────────────────────────────
     vae = AutoencoderKLWan.from_pretrained(

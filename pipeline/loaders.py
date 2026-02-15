@@ -118,39 +118,56 @@ def load_vae(cfg: dict):
 
 
 def load_single_transformer(cfg: dict, which: str = "high"):
-    """Load ONE GGUF transformer to halve peak RAM (~10 GB instead of ~20 GB).
+    """Load ONE transformer model (GGUF or safetensors).
+
+    Auto-detects format from file extension:
+      .gguf         — loaded with GGUFQuantizationConfig (Q8_0 / Q6_K)
+      .safetensors   — loaded directly (FP8, FP16, BF16, etc.)
 
     Args:
         which: "high" for high-noise transformer, "low" for low-noise.
     """
-    from diffusers import WanTransformer3DModel, GGUFQuantizationConfig
+    from diffusers import WanTransformer3DModel
 
     model_id = cfg["model_id"]
     amd = cfg.get("amd", {})
     force_fp16 = amd.get("force_fp16", False)
     dtype = torch.float16 if force_fp16 else torch.bfloat16
-    quant_config = GGUFQuantizationConfig(compute_dtype=dtype)
 
     if which == "high":
-        gguf_path = cfg["gguf_transformer_high"]
+        model_path = cfg["gguf_transformer_high"]
         subfolder = "transformer"
     else:
-        gguf_path = cfg["gguf_transformer_low"]
+        model_path = cfg["gguf_transformer_low"]
         subfolder = "transformer_2"
 
-    print(f"  Loading GGUF transformer ({which}): {gguf_path}")
-    transformer = WanTransformer3DModel.from_single_file(
-        gguf_path,
-        quantization_config=quant_config,
-        config=model_id,
-        subfolder=subfolder,
-        torch_dtype=dtype,
-    )
+    is_gguf = model_path.lower().endswith(".gguf")
+
+    if is_gguf:
+        from diffusers import GGUFQuantizationConfig
+        quant_config = GGUFQuantizationConfig(compute_dtype=dtype)
+        print(f"  Loading GGUF transformer ({which}): {model_path}")
+        transformer = WanTransformer3DModel.from_single_file(
+            model_path,
+            quantization_config=quant_config,
+            config=model_id,
+            subfolder=subfolder,
+            torch_dtype=dtype,
+        )
+    else:
+        print(f"  Loading safetensors transformer ({which}): {model_path}")
+        transformer = WanTransformer3DModel.from_single_file(
+            model_path,
+            config=model_id,
+            subfolder=subfolder,
+            torch_dtype=dtype,
+        )
+
     return transformer
 
 
 def load_transformers(cfg: dict):
-    """Load both GGUF transformers (legacy — kept for backward compat)."""
+    """Load both transformers (legacy — kept for backward compat)."""
     high = load_single_transformer(cfg, "high")
     low = load_single_transformer(cfg, "low")
     return high, low

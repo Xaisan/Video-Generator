@@ -33,7 +33,7 @@ PRESETS_FILE = Path("presets.json")
 
 # Supported file extensions per model type
 MODEL_EXTENSIONS = {
-    "unet": {".gguf"},
+    "unet": {".gguf", ".safetensors"},
     "loras": {".safetensors"},
     "vae": {".safetensors", ".pt", ".pth", ".bin"},
     "text_encoders": {".safetensors", ".pt", ".pth", ".bin"},
