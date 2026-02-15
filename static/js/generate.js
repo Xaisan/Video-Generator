@@ -36,8 +36,8 @@ const Generate = (() => {
 
     if (hint) {
       hint.textContent = mode === "quality"
-        ? "Quality mode: 20 steps, CFG=5.0, quality LoRAs only"
-        : "Fast mode: 4 steps, no CFG (baked in), LightX2V distill — ~10× faster";
+        ? "Quality defaults: 20 steps, CFG=5.0 — adjust freely"
+        : "Fast defaults: 4 steps, CFG=1.0 (raise CFG for stronger prompt adherence)";
     }
 
     const preset = mode === "fast" ? FAST_DEFAULTS : QUALITY_DEFAULTS;
@@ -57,8 +57,8 @@ const Generate = (() => {
 
     if (!silent) {
       App.toast(mode === "quality"
-        ? "🎨 Quality mode — distill LoRAs disabled, full CFG"
-        : "⚡ Fast mode — LightX2V distill, CFG=1.0, 4 steps",
+        ? "🎨 Quality defaults applied — all params adjustable"
+        : "⚡ Fast defaults applied — increase CFG for more prompt control",
         "info", 3000);
     }
   }

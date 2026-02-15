@@ -254,55 +254,61 @@ class PipelineEngine:
             use_offload = cfg.get("enable_group_offload", True)
             force_vae_cpu = cfg.get("force_vae_cpu", False)
 
-            # ── Distill LoRA mode detection ──
-            # When distill_lora_mode=True, LightX2V CFG-distilled LoRAs are used.
-            # This REQUIRES: CFG=1.0 (guidance baked into weights),
-            # 4 steps (what the model was trained on), flow_shift=5.0.
-            #
-            # When distill_lora_mode=False (QUALITY mode), we enforce minimum
-            # sane defaults so users can't accidentally run quality mode with
-            # distill-level parameters (CFG=1.0 + 4 steps → bland, textureless).
+            # ── Mode detection & logging ──
+            # Distill and Quality modes set recommended defaults in the UI,
+            # but the user has full control.  We only LOG warnings here.
             distill_lora_mode = getattr(info, "distill_lora_mode", False)
+            flow_shift = getattr(info, "flow_shift", None) or cfg.get("flow_shift", 8.0)
+
             if distill_lora_mode:
-                print("  ⚡ DISTILL MODE: LightX2V enabled — "
-                      "forcing CFG=1.0, 4 steps, flow_shift=5.0")
-                info.guidance_scale = 1.0
-                info.guidance_scale_2 = 1.0
-                info.num_inference_steps = 4
-                flow_shift = 5.0
+                warnings = []
+                if info.guidance_scale != 1.0 or info.guidance_scale_2 != 1.0:
+                    warnings.append(f"CFG={info.guidance_scale}/{info.guidance_scale_2} "
+                                    f"(distill default: 1.0 — higher = more prompt adherence "
+                                    f"but may introduce artefacts)")
+                if info.num_inference_steps != 4:
+                    warnings.append(f"steps={info.num_inference_steps} (distill default: 4)")
+                if flow_shift != 5.0:
+                    warnings.append(f"flow_shift={flow_shift} (distill default: 5.0)")
+
+                if warnings:
+                    print(f"  ⚡ DISTILL MODE: custom overrides — {', '.join(warnings)}")
+                else:
+                    print("  ⚡ DISTILL MODE: LightX2V enabled — default params")
+
                 if self._slog:
                     self._slog.log("denoise", "⚡ DISTILL MODE ACTIVE")
-                    self._slog.log("denoise", "  → CFG forced to 1.0 (baked into distill weights)")
-                    self._slog.log("denoise", "  → Steps forced to 4 (distill training schedule)")
-                    self._slog.log("denoise", "  → flow_shift forced to 5.0 (LightX2V recommendation)")
+                    if warnings:
+                        for w in warnings:
+                            self._slog.log("denoise", f"  ⚠ {w}")
+                    self._slog.log("denoise", f"  CFG={info.guidance_scale}/{info.guidance_scale_2}, "
+                                   f"steps={info.num_inference_steps}, flow_shift={flow_shift}")
             else:
-                # QUALITY MODE — enforce sane minimums.
-                # Without CFG > 1.0, the model has no guidance → flat/bland output.
-                # Without enough steps, the solver can't converge → mushy detail.
-                flow_shift = getattr(info, "flow_shift", None) or cfg.get("flow_shift", 8.0)
-                enforced = []
+                # QUALITY MODE — log settings, no enforcement
+                warnings = []
                 if info.guidance_scale < 2.0:
-                    info.guidance_scale = cfg.get("guidance_scale", 5.0)
-                    enforced.append(f"CFG_high→{info.guidance_scale}")
+                    warnings.append(f"CFG_high={info.guidance_scale} is very low "
+                                    f"(recommended ≥2.0 for quality mode)")
                 if info.guidance_scale_2 < 2.0:
-                    info.guidance_scale_2 = cfg.get("guidance_scale_2", 5.0)
-                    enforced.append(f"CFG_low→{info.guidance_scale_2}")
+                    warnings.append(f"CFG_low={info.guidance_scale_2} is very low")
                 if info.num_inference_steps < 8:
-                    info.num_inference_steps = cfg.get("num_inference_steps", 20)
-                    enforced.append(f"steps→{info.num_inference_steps}")
-                if flow_shift < 6.0:
-                    flow_shift = cfg.get("flow_shift", 8.0)
-                    enforced.append(f"flow_shift→{flow_shift}")
+                    warnings.append(f"steps={info.num_inference_steps} is very low "
+                                    f"(recommended ≥8 for quality mode)")
+                if flow_shift < 3.0:
+                    warnings.append(f"flow_shift={flow_shift} is very low")
 
-                if enforced:
-                    print(f"  🎨 QUALITY MODE: enforced sane defaults: {', '.join(enforced)}")
+                if warnings:
+                    print(f"  🎨 QUALITY MODE: ⚠ {', '.join(warnings)}")
+                    if self._slog:
+                        self._slog.log("denoise", "🎨 QUALITY MODE — distill LoRAs will be skipped")
+                        for w in warnings:
+                            self._slog.log("denoise", f"  ⚠ {w}")
                 else:
-                    print("  🎨 QUALITY MODE: user parameters look good")
+                    print("  🎨 QUALITY MODE: parameters look good")
+                    if self._slog:
+                        self._slog.log("denoise", "🎨 QUALITY MODE — distill LoRAs will be skipped")
 
                 if self._slog:
-                    self._slog.log("denoise", "🎨 QUALITY MODE — distill LoRAs will be skipped")
-                    if enforced:
-                        self._slog.log("denoise", f"  → Enforced minimums: {', '.join(enforced)}")
                     self._slog.log("denoise", f"  CFG={info.guidance_scale}/{info.guidance_scale_2}, "
                                    f"steps={info.num_inference_steps}, flow_shift={flow_shift}")
 

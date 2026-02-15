@@ -907,8 +907,14 @@ def api_update_user(user_id):
 
 @app.route("/api/users/<user_id>", methods=["DELETE"])
 def api_delete_user(user_id):
-    """Delete a user profile. Sessions are preserved (become unowned)."""
+    """Delete a user profile. Sessions are preserved (become unowned/global)."""
     if um.delete_user(user_id):
+        # Clear user_id/user_name on all sessions that belonged to this user
+        # so they become visible in global space
+        for s in sm.list_sessions_for_user(user_id, limit=9999):
+            s.user_id = ""
+            s.user_name = ""
+            sm._save_meta(s)
         return jsonify({"ok": True})
     return jsonify({"error": "User not found"}), 404
 
