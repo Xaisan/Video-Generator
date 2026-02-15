@@ -1,21 +1,35 @@
 #!/usr/bin/env python3
 """
-Post-generation upscale pipeline (professional order):
-  1. Spatial 4× upscale — via spandrel (ESRGAN/DAT/SwinIR model)
-  2. RIFE frame interpolation — at high resolution for best motion quality
+upscale.py — Post-generation video upscale + frame interpolation
+================================================================
 
-Upscale-first-then-interpolate is the correct professional order:
-  - RIFE gets 4× more spatial detail to analyse motion
+Two-phase post-processing pipeline (professional order):
+  Phase 1: Spatial 4x upscale — via spandrel (ESRGAN/DAT/SwinIR/etc.)
+  Phase 2: RIFE frame interpolation — at high resolution for best quality
+
+Upscale-first-then-interpolate rationale:
+  - RIFE gets 4x more spatial detail to analyse motion
   - Only real frames get upscaled (fewer tiles to process)
-  - RIFE is lightweight (21 MB) — running it at 4× resolution is fast
+  - RIFE is lightweight (21 MB) — running it at 4x resolution is fast
 
 Target duration support:
-  - If target_duration > source duration → slow-motion (more interpolated frames)
-  - If target_duration < source duration → speed-up (fewer frames)
-  - If target_duration == 0 → preserve original duration (standard fps conversion)
+  - target_duration > source -> slow-motion (more interpolated frames)
+  - target_duration < source -> speed-up (fewer frames)
+  - target_duration == 0     -> preserve original duration (standard fps conversion)
 
-Processes frame-by-frame with tiling to stay within VRAM budget.
-RIFE model is loaded/freed separately from the spatial upscale model.
+Dependencies (project-internal):
+  -> rife_model.py  (load_rife_model, interpolate_frame)
+
+Public API:
+  upscale_video()      — main entry: read video -> upscale -> interpolate -> write
+  load_upscale_model() — load spatial model via spandrel
+  tile_upscale()       — tiled inference on BCHW tensor
+  upscale_frame()      — upscale single HWC uint8 frame
+
+Called from: pipeline_engine.py -> PipelineEngine.step_upscale()
+             generate.py -> generate() (if enable_upscale=True)
+
+CLI usage: python upscale.py input.mp4 output.mp4 [output_fps] [target_duration]
 """
 
 import gc

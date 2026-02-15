@@ -1,16 +1,56 @@
 #!/usr/bin/env python3
 """
-Session Manager — persistent checkpoint storage for the video generation pipeline.
+session_manager.py — Persistent session & checkpoint storage
+=============================================================
 
-Each session gets a directory under sessions/<session_id>/ containing:
-  session.json    — metadata (params, timestamps, status, which checkpoints exist)
-  input.png       — copy of the input image
-  embeddings.pt   — encoded text + image embeddings (after encode step)
-  latents.pt      — denoised latent tensor (after denoise step)
-  frames.pt       — decoded video frames tensor (after VAE decode step)
-  preview.mp4     — low-quality preview from frames
-  output.mp4      — final exported video
-  output_upscaled.mp4 — optional upscaled video
+Manages the lifecycle of generation sessions. Each session is a directory
+under sessions/<session_id>/ with JSON metadata and PyTorch checkpoints.
+
+Dependencies (project-internal): none (this is a leaf module)
+External: json, os, shutil, time, uuid, torch
+
+Public API:
+  Constants:
+    SESSIONS_DIR         — Path("sessions")
+    STEP_ORDER           — ["encode", "denoise", "vae_decode", "export", "upscale"]
+
+  Enums:
+    StepStatus           — pending | running | done | failed | skipped
+
+  Dataclasses:
+    SessionInfo          — all session metadata + generation parameters
+      .to_dict()         — serialise to JSON-safe dict
+      .from_dict()       — deserialise from dict
+
+  Classes:
+    SessionManager       — CRUD + checkpoint operations
+      .create_session()  — create new session from params dict
+      .get_session()     — load session by ID
+      .list_sessions()   — list all sessions (newest first)
+      .delete_session()  — remove session directory
+      .update_step()     — update step status + timing
+      .update_status()   — update overall session status
+      .save_checkpoint() — save a torch.Tensor as .pt file
+      .load_checkpoint() — load a .pt checkpoint
+      .has_checkpoint()  — check if checkpoint exists
+      .save_file()       — copy a file into session dir
+      .get_file_path()   — get path to a session file
+      .session_dir()     — get session directory path
+
+Session directory layout:
+  sessions/<timestamp>_<uuid8>/
+  +-- session.json           # Metadata (params, step statuses, timing)
+  +-- input.png              # Copy of input image
+  +-- embeddings.pt          # After encode step
+  +-- latents.pt             # After denoise step
+  +-- frames.pt              # After VAE decode step
+  +-- preview.mp4            # Quick preview
+  +-- output.mp4             # Final video
+  +-- output_upscaled.mp4    # Optional upscaled video
+  +-- generation.log         # Pipeline execution diary
+  +-- vram.log               # VRAM allocation timeline
+
+Used by: app.py, pipeline_engine.py
 """
 
 import json
@@ -68,6 +108,14 @@ class SessionInfo:
     upscale_model: str = "models/upscale_models/4xRealWebPhoto_v4_dat2.pth"
     boundary_ratio: float = 0.9    # High/low noise boundary split (official model default)
     distill_lora_mode: bool = False # True = fast 4-step distill, False = quality mode
+
+    # Model preset (optional — overrides config.yaml model paths)
+    preset_id: str = ""
+    preset_name: str = ""
+
+    # User profile (optional — empty string = global/unowned)
+    user_id: str = ""
+    user_name: str = ""
 
     # LoRA overrides (list of {adapter_name, scale})
     lora_scales: list = field(default_factory=list)
@@ -142,6 +190,10 @@ class SessionManager:
             boundary_ratio=float(params.get("boundary_ratio", 0.9)),
             lora_scales=params.get("lora_scales", []),
             distill_lora_mode=bool(params.get("distill_lora_mode", False)),
+            preset_id=params.get("preset_id", ""),
+            preset_name=params.get("preset_name", ""),
+            user_id=params.get("user_id", ""),
+            user_name=params.get("user_name", ""),
         )
 
         # Copy input image into session
@@ -177,6 +229,14 @@ class SessionManager:
             if len(sessions) >= limit:
                 break
         return sessions
+
+    def list_sessions_for_user(self, user_id: str, limit: int = 100) -> list[SessionInfo]:
+        """Return sessions filtered by user_id. Empty user_id = global (all sessions)."""
+        all_sessions = self.list_sessions(limit=9999)
+        if not user_id:
+            return all_sessions[:limit]
+        filtered = [s for s in all_sessions if s.user_id == user_id]
+        return filtered[:limit]
 
     def delete_session(self, session_id: str) -> bool:
         sdir = self._session_dir(session_id)

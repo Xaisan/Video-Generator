@@ -1,7 +1,27 @@
 #!/usr/bin/env python3
 """
-AMD ROCm tuning helpers for Wan 2.2 I2V pipeline.
-Run standalone for a quick diagnostic, or import apply_amd_optimisations().
+amd_tune.py — AMD ROCm GPU detection, tuning, and benchmarking
+==============================================================
+
+Pure PyTorch utility — no project dependencies (leaf module).
+Can be run standalone for GPU diagnostics: python amd_tune.py
+
+Dependencies (project-internal): none
+External: torch, os, sys
+
+Public API:
+  apply_amd_optimisations(cfg) — set all AMD env vars from config
+  detect_amd_gpu()             — return GPU info dict
+  benchmark_matmul()           — quick TFLOPS throughput test
+  main()                       — CLI diagnostic runner
+
+Environment variables set:
+  HSA_OVERRIDE_GFX_VERSION     — GFX ISA override (e.g. "11.0.0" for gfx1100)
+  PYTORCH_HIP_ALLOC_CONF      — expandable_segments:True
+  HIP_VISIBLE_DEVICES          — "0" (single GPU)
+  TOKENIZERS_PARALLELISM       — "false"
+
+Used by: app.py (at startup), pipeline_engine.py (apply_amd_env)
 """
 
 import os

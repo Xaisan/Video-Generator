@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Preset Report — Wan 2.2 I2V</title>
+  <link rel="stylesheet" href="/static/css/theme.css" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 32px;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+
+    .report-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 32px;
+      padding-bottom: 16px;
+      border-bottom: 2px solid var(--border);
+    }
+    .report-header h1 {
+      font-size: 24px;
+      font-weight: 700;
+    }
+    .report-header .report-meta {
+      font-size: 13px;
+      color: var(--text-dim);
+    }
+    .report-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .report-actions button,
+    .report-actions a {
+      padding: 6px 14px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      text-decoration: none;
+      transition: all .15s;
+    }
+    .report-actions button:hover,
+    .report-actions a:hover {
+      background: var(--bg-hover);
+      border-color: var(--accent-dim);
+    }
+
+    .preset-count-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--accent-dim);
+      color: #fff;
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .preset-report-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin-bottom: 20px;
+      overflow: hidden;
+      transition: border-color .2s;
+      page-break-inside: avoid;
+    }
+    .preset-report-card:hover {
+      border-color: var(--accent-dim);
+    }
+
+    .preset-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 20px;
+      background: var(--bg-hover);
+      border-bottom: 1px solid var(--border);
+    }
+    .preset-card-title {
+      font-size: 18px;
+      font-weight: 700;
+    }
+    .preset-card-id {
+      font-size: 11px;
+      font-family: "JetBrains Mono", "Fira Code", monospace;
+      color: var(--text-muted);
+      background: var(--bg);
+      padding: 2px 8px;
+      border-radius: 4px;
+    }
+
+    .preset-card-body {
+      padding: 16px 20px;
+    }
+
+    .preset-desc {
+      font-size: 14px;
+      color: var(--text-dim);
+      margin-bottom: 16px;
+      font-style: italic;
+    }
+
+    .preset-section-label {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+      margin-top: 14px;
+    }
+    .preset-section-label:first-child {
+      margin-top: 0;
+    }
+
+    .model-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .model-item {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      padding: 8px 12px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .model-item-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: .4px;
+    }
+    .model-item-value {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--accent);
+      font-family: "JetBrains Mono", "Fira Code", monospace;
+      word-break: break-all;
+    }
+    .model-item-value.empty {
+      color: var(--text-muted);
+      font-style: italic;
+      font-family: inherit;
+    }
+
+    .lora-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin-top: 4px;
+    }
+    .lora-table th {
+      text-align: left;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: .4px;
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .lora-table td {
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    .lora-table tr:last-child td {
+      border-bottom: none;
+    }
+    .lora-table .lora-path-cell {
+      font-family: "JetBrains Mono", "Fira Code", monospace;
+      font-size: 11px;
+      color: var(--text-dim);
+      word-break: break-all;
+    }
+    .lora-table .lora-scale-cell {
+      font-family: "JetBrains Mono", "Fira Code", monospace;
+      font-weight: 600;
+      color: var(--accent);
+      text-align: center;
+    }
+
+    .lora-badge {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 6px;
+      border-radius: 3px;
+      letter-spacing: .5px;
+    }
+    .badge-high { background: var(--badge-high); color: var(--badge-high-text); }
+    .badge-low { background: var(--badge-low); color: var(--badge-low-text); }
+    .badge-distill { background: #2a1a3a; color: #d19af8; }
+    [data-theme="light"] .badge-distill { background: #f0e6ff; color: #7c3aed; }
+
+    .defaults-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .default-item {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      padding: 6px 10px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .default-item-label {
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: .3px;
+    }
+    .default-item-value {
+      font-size: 15px;
+      font-weight: 700;
+      font-family: "JetBrains Mono", "Fira Code", monospace;
+      color: var(--text);
+    }
+    .mode-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 4px;
+    }
+    .mode-badge.quality { background: #0d3321; color: var(--success); }
+    .mode-badge.fast { background: #2a1a3a; color: #d19af8; }
+    [data-theme="light"] .mode-badge.quality { background: #dafbe1; color: var(--success); }
+    [data-theme="light"] .mode-badge.fast { background: #f0e6ff; color: #7c3aed; }
+
+    .preset-timestamps {
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--text-muted);
+      display: flex;
+      gap: 20px;
+    }
+
+    .no-presets {
+      text-align: center;
+      padding: 80px 20px;
+      color: var(--text-dim);
+    }
+    .no-presets-icon {
+      font-size: 48px;
+      margin-bottom: 16px;
+      opacity: .5;
+    }
+
+    .no-loras {
+      color: var(--text-muted);
+      font-style: italic;
+      font-size: 13px;
+      padding: 4px 0;
+    }
+
+    /* Print styles */
+    @media print {
+      body { padding: 16px; background: #fff; color: #000; }
+      .report-actions { display: none; }
+      .preset-report-card { break-inside: avoid; border-color: #ccc; }
+      .preset-card-header { background: #f5f5f5; }
+    }
+  </style>
+</head>
+<body>
+  <div class="report-header">
+    <div>
+      <h1>🗂️ Model Presets Report</h1>
+      <div class="report-meta">
+        <span class="preset-count-badge">{{ presets | length }} preset{{ 's' if presets | length != 1 else '' }}</span>
+        &nbsp; Generated: <span id="report-date"></span>
+      </div>
+    </div>
+    <div class="report-actions">
+      <button onclick="window.print()" title="Print this report">🖨️ Print</button>
+      <button onclick="exportJSON()" title="Download as JSON">📄 Export JSON</button>
+      <a href="/" title="Back to main app">← Back</a>
+    </div>
+  </div>
+
+  {% if presets %}
+  {% for preset in presets %}
+  <div class="preset-report-card">
+    <div class="preset-card-header">
+      <span class="preset-card-title">{{ preset.name }}</span>
+      <span class="preset-card-id">{{ preset.id }}</span>
+    </div>
+    <div class="preset-card-body">
+      {% if preset.description %}
+      <div class="preset-desc">{{ preset.description }}</div>
+      {% endif %}
+
+      <!-- Models -->
+      <div class="preset-section-label">🖥️ Models</div>
+      <div class="model-grid">
+        <div class="model-item">
+          <span class="model-item-label">High-Noise Transformer</span>
+          <span class="model-item-value{% if not preset.gguf_transformer_high %} empty{% endif %}">
+            {{ preset.gguf_transformer_high | basename if preset.gguf_transformer_high else '— config.yaml default —' }}
+          </span>
+        </div>
+        <div class="model-item">
+          <span class="model-item-label">Low-Noise Transformer</span>
+          <span class="model-item-value{% if not preset.gguf_transformer_low %} empty{% endif %}">
+            {{ preset.gguf_transformer_low | basename if preset.gguf_transformer_low else '— config.yaml default —' }}
+          </span>
+        </div>
+        <div class="model-item">
+          <span class="model-item-label">VAE</span>
+          <span class="model-item-value{% if not preset.vae_path %} empty{% endif %}">
+            {{ preset.vae_path | basename if preset.vae_path else '— config.yaml default —' }}
+          </span>
+        </div>
+        <div class="model-item">
+          <span class="model-item-label">Text Encoder</span>
+          <span class="model-item-value{% if not preset.text_encoder_path %} empty{% endif %}">
+            {{ preset.text_encoder_path | basename if preset.text_encoder_path else '— config.yaml default —' }}
+          </span>
+        </div>
+      </div>
+
+      <!-- LoRAs -->
+      <div class="preset-section-label">🔧 LoRA Adapters</div>
+      {% if preset.loras %}
+      <table class="lora-table">
+        <thead>
+          <tr>
+            <th>Adapter Name</th>
+            <th>Target</th>
+            <th>Role</th>
+            <th>Scale</th>
+            <th>File</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for lora in preset.loras %}
+          <tr>
+            <td><strong>{{ lora.adapter_name }}</strong></td>
+            <td>
+              <span class="lora-badge {{ 'badge-high' if lora.target == 'transformer' else 'badge-low' }}">
+                {{ 'HIGH' if lora.target == 'transformer' else 'LOW' }}
+              </span>
+            </td>
+            <td>
+              {% if lora.role == 'distill' %}
+              <span class="lora-badge badge-distill">⚡ distill</span>
+              {% else %}
+              {{ lora.role or 'quality' }}
+              {% endif %}
+            </td>
+            <td class="lora-scale-cell">{{ lora.scale }}</td>
+            <td class="lora-path-cell">{{ lora.path | basename }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <div class="no-loras">No LoRAs configured — uses config.yaml defaults</div>
+      {% endif %}
+
+      <!-- Default Parameters -->
+      <div class="preset-section-label">⚙️ Default Parameters</div>
+      <div class="defaults-grid">
+        <div class="default-item">
+          <span class="default-item-label">Steps</span>
+          <span class="default-item-value">{{ preset.defaults.num_inference_steps }}</span>
+        </div>
+        <div class="default-item">
+          <span class="default-item-label">CFG Scale</span>
+          <span class="default-item-value">{{ preset.defaults.guidance_scale }}</span>
+        </div>
+        <div class="default-item">
+          <span class="default-item-label">CFG Scale 2</span>
+          <span class="default-item-value">{{ preset.defaults.guidance_scale_2 }}</span>
+        </div>
+        <div class="default-item">
+          <span class="default-item-label">Flow Shift</span>
+          <span class="default-item-value">{{ preset.defaults.flow_shift }}</span>
+        </div>
+        <div class="default-item">
+          <span class="default-item-label">Boundary</span>
+          <span class="default-item-value">{{ preset.defaults.boundary_ratio }}</span>
+        </div>
+        <div class="default-item">
+          <span class="default-item-label">Mode</span>
+          <span class="mode-badge {{ 'fast' if preset.defaults.distill_lora_mode else 'quality' }}">
+            {{ '⚡ Fast' if preset.defaults.distill_lora_mode else '🎨 Quality' }}
+          </span>
+        </div>
+      </div>
+
+      <!-- Timestamps -->
+      <div class="preset-timestamps">
+        <span>Created: <span class="ts" data-ts="{{ preset.created_at }}"></span></span>
+        <span>Updated: <span class="ts" data-ts="{{ preset.updated_at }}"></span></span>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+  {% else %}
+  <div class="no-presets">
+    <div class="no-presets-icon">🗂️</div>
+    <p>No presets configured yet</p>
+    <p style="color: var(--text-muted); font-size: 13px; margin-top: 8px;">
+      Create presets from the main app to see them here
+    </p>
+  </div>
+  {% endif %}
+
+  <script>
+    // Format timestamps
+    document.getElementById("report-date").textContent = new Date().toLocaleString();
+    document.querySelectorAll(".ts").forEach(el => {
+      const ts = parseFloat(el.dataset.ts);
+      if (ts) {
+        el.textContent = new Date(ts * 1000).toLocaleString();
+      }
+    });
+
+    // Theme sync
+    const saved = localStorage.getItem("theme") || "dark";
+    document.documentElement.setAttribute("data-theme", saved);
+
+    // Export as JSON
+    function exportJSON() {
+      fetch("/api/presets")
+        .then(r => r.json())
+        .then(data => {
+          const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "presets_report_" + new Date().toISOString().slice(0, 10) + ".json";
+          a.click();
+          URL.revokeObjectURL(url);
+        });
+    }
+  </script>
+</body>
+</html>

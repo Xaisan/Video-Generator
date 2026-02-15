@@ -1,19 +1,38 @@
 #!/usr/bin/env python3
 """
-Wan 2.2 Image-to-Video Generator — AMD ROCm Optimised
-======================================================
-Replaces ComfyUI with a lean, headless diffusers pipeline tuned for
-Radeon RX 7900 XTX (gfx1100) + Ryzen 9 9950X.
+generate.py — Standalone CLI video generator (no web UI, no checkpointing)
+==========================================================================
+
+This is the OLDER standalone script. For production use, prefer the Web UI
+(app.py -> pipeline_engine.py) which has checkpointing, resume, and SSE.
+
+Run: python generate.py [-c config.yaml] [-i image.jpg] [-p "prompt"] [-o out.mp4]
+
+This script loads ALL models into one pipeline and runs end-to-end.
+No session management, no intermediate checkpoints.
+
+Dependencies (project-internal):
+  -> upscale.py  (upscale_video) — for optional post-generation upscale
+
+NOTE: Some logic here is DUPLICATED from pipeline_engine.py:
+  - apply_amd_env(), load_config(), prepare_image()
+  - load_loras(), setup_offloading(), build_pipeline()
+  If you change core generation logic, update pipeline_engine.py instead.
+  This file is kept for backward compatibility and batch scripting.
+
+Public API:
+  build_pipeline()   — construct full Wan 2.2 I2V pipeline
+  generate()         — run two-stage denoising + export video
+  load_loras()       — load LoRA adapters (unfused, GGUF-compatible)
+  setup_offloading() — apply group offloading for VRAM management
+  prepare_image()    — load + resize to VAE-compatible dimensions
+  main()             — CLI entry point
 
 Key design:
-  • Transformers loaded from local GGUF files (Q6_K) via from_single_file()
-  • Two-stage denoising:
-      transformer   (high-noise stage, steps 0 … boundary)
-      transformer_2 (low-noise stage,  boundary … end)
-  • LoRAs applied UNFUSED (GGUF stores uint quantized weights; fusing
-    requires bfloat16 weight shapes → incompatible).  LoRAs are loaded
-    BEFORE group offloading is applied.
-  • Group-offloading keeps peak VRAM ≈14 GB for the 14B model.
+  - Transformers loaded from local GGUF files via from_single_file()
+  - Two-stage denoising (high-noise -> low-noise split by boundary)
+  - LoRAs applied UNFUSED (GGUF uint weights incompatible with fusion)
+  - Group-offloading keeps peak VRAM ~14 GB for the 14B model
 """
 
 import os

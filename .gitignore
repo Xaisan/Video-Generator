@@ -1,8 +1,27 @@
-# ignore models
+# ─── Runtime data (large / user-specific) ──────────────────────
 models/
 input/
 output/
 sessions/
 hf_cache/
+
+# ─── Python artifacts ──────────────────────────────────────────
 .venv/
 __pycache__/
+*.pyc
+*.pyo
+
+# ─── Backup files ─────────────────────────────────────────────
+*.bak
+*.old
+
+# ─── OS junk ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── IDE / editor ────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

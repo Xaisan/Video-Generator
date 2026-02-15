@@ -21,6 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ─── Copy project code ─────────────────────────────────────────────
 COPY generate.py config.yaml amd_tune.py upscale.py rife_model.py ./
 COPY session_manager.py pipeline_engine.py app.py ./
+COPY pipeline/ pipeline/
 COPY templates/ templates/
 COPY static/ static/
 

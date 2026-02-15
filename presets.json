@@ -1,0 +1,79 @@
+{
+  "presets": {
+    "1771172368_cee2f3af": {
+      "name": "Quality Q8",
+      "description": "Updated",
+      "gguf_transformer_high": "models/unet/Wan2.2-I2V-A14B-HighNoise-Q8_0.gguf",
+      "gguf_transformer_low": "models/unet/Wan2.2-I2V-A14B-LowNoise-Q8_0.gguf",
+      "vae_path": "models/vae/wan_2.1_vae.safetensors",
+      "text_encoder_path": "",
+      "loras": [
+        {
+          "path": "models/loras/DR3_I2V_14B_HIGH_V2.safetensors",
+          "adapter_name": "dr3_high",
+          "target": "transformer",
+          "role": "quality",
+          "scale": 1.0
+        },
+        {
+          "path": "models/loras/DR3_I2V_14B_LOW_V2.safetensors",
+          "adapter_name": "dr3_low",
+          "target": "transformer_2",
+          "role": "quality",
+          "scale": 1.0
+        }
+      ],
+      "defaults": {
+        "num_inference_steps": 20,
+        "guidance_scale": 5.0,
+        "guidance_scale_2": 5.0,
+        "flow_shift": 8.0,
+        "boundary_ratio": 0.9,
+        "distill_lora_mode": false
+      },
+      "created_at": 1771172368.9087436,
+      "updated_at": 1771173217.0993917
+    },
+    "1771173163_492be4f4": {
+      "name": "Fast Distill Q8",
+      "description": "Q8_0 with LightX2V distill for 4-step generation",
+      "gguf_transformer_high": "models/unet/Wan2.2-I2V-A14B-HighNoise-Q8_0.gguf",
+      "gguf_transformer_low": "models/unet/Wan2.2-I2V-A14B-LowNoise-Q8_0.gguf",
+      "vae_path": "models/vae/wan_2.1_vae.safetensors",
+      "text_encoder_path": "",
+      "loras": [
+        {
+          "path": "models/loras/wan2.2_t2v_A14b_high_noise_lora_rank64_lightx2v_4step_1217.safetensors",
+          "adapter_name": "lightx2v_high",
+          "target": "transformer",
+          "role": "distill",
+          "scale": 3.0
+        },
+        {
+          "path": "models/loras/wan2.2_t2v_A14b_low_noise_lora_rank64_lightx2v_4step_1217.safetensors",
+          "adapter_name": "lightx2v_low",
+          "target": "transformer_2",
+          "role": "distill",
+          "scale": 3.0
+        },
+        {
+          "path": "models/loras/Wan21_I2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors",
+          "adapter_name": "cfg_distill",
+          "target": "transformer",
+          "role": "distill",
+          "scale": 1.0
+        }
+      ],
+      "defaults": {
+        "num_inference_steps": 4,
+        "guidance_scale": 1.0,
+        "guidance_scale_2": 1.0,
+        "flow_shift": 5.0,
+        "boundary_ratio": 0.9,
+        "distill_lora_mode": true
+      },
+      "created_at": 1771173163.7205393,
+      "updated_at": 1771173163.7205396
+    }
+  }
+}

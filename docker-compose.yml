@@ -39,8 +39,13 @@ services:
       - ./generate.py:/app/generate.py:ro
       - ./config.yaml:/app/config.yaml:ro
       - ./amd_tune.py:/app/amd_tune.py:ro
+      - ./preset_manager.py:/app/preset_manager.py:ro
+      - ./user_manager.py:/app/user_manager.py:ro
+      - ./pipeline:/app/pipeline:ro
       - ./templates:/app/templates:ro
       - ./static:/app/static:ro
+      - ./presets.json:/app/presets.json
+      - ./users.json:/app/users.json
 
 volumes:
   hf_cache:

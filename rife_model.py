@@ -1,12 +1,34 @@
 #!/usr/bin/env python3
 """
-RIFE v4.7 — Real-Time Intermediate Flow Estimation for frame interpolation.
+rife_model.py — RIFE v4.7 neural network for frame interpolation
+================================================================
 
-Architecture adapted from:
+Pure PyTorch implementation of IFNet (Real-Time Intermediate Flow Estimation).
+No project dependencies — this is a leaf module.
+
+Architecture: coarse-to-fine optical flow with v4.7 feature encoding.
+Model file: rife47.pth (21 MB)
+
+Adapted from:
   - https://github.com/hzwer/Practical-RIFE
   - https://github.com/HolyWu/vs-rife (IFNet_HDv3_v4_7.py)
 
-Loads rife47.pth (21 MB) for temporal upscaling during post-generation upscale.
+Dependencies (project-internal): none
+External: torch, numpy
+
+Public API:
+  Classes:
+    IFNet                  — RIFE v4.7 network (4 IFBlock stages + encoder)
+    IFBlock                — single flow estimation block
+    ResConv                — residual convolution with learnable beta
+
+  Functions:
+    load_rife_model()      — load .pth file -> IFNet on device
+    interpolate_frame()    — interpolate single frame between two inputs
+    interpolate_sequence() — interpolate full sequence to target fps
+    warp()                 — optical flow warping via grid_sample
+
+Used by: upscale.py -> upscale_video()
 """
 
 import torch

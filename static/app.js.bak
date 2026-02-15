@@ -1,4 +1,22 @@
-/* ── Wan 2.2 I2V — Web UI Frontend ──────────────────────────────── */
+/*
+ * app.js — Wan 2.2 I2V Web UI Frontend
+ * =====================================
+ *
+ * Single-page application (IIFE) handling:
+ *   - SSE event stream for real-time generation progress
+ *   - Session list rendering and navigation
+ *   - Generate form: image upload, parameter controls, hybrid slider+number inputs
+ *   - Session detail view: step progress bars, video playback, logs
+ *   - Dark/light theme toggle
+ *   - Keyboard shortcuts (Enter=generate, Esc=cancel, Ctrl+N=new)
+ *
+ * Communicates with Flask backend via:
+ *   - REST API (fetch): /api/generate, /api/sessions, /api/upload, etc.
+ *   - SSE stream: /api/events (progress, generation_complete events)
+ *
+ * Dependencies: none (vanilla JS, no frameworks)
+ * See also: API_REFERENCE.md for all endpoints
+ */
 
 (() => {
   "use strict";
@@ -7,12 +25,18 @@
   let currentSessionId = null;
   let sessions = [];
   let evtSource = null;
-  let generationStartTime = null;      // epoch ms when generation started
-  let timerInterval = null;             // setInterval for elapsed timer
-  let autoRefreshInterval = null;       // polling during running session
-  let logPollInterval = null;           // log polling interval
-  let lastLogTs = 0;                    // last log timestamp fetched
-  let stepProgressData = {};            // { step: pct } for per-step mini-bars
+  let generationStartTime = null;
+  let timerInterval = null;
+  let autoRefreshInterval = null;
+  let logPollInterval = null;
+  let lastLogTs = 0;
+  let stepProgressData = {};
+
+  // Preset state
+  let availableModels = window.__AVAILABLE_MODELS || {};
+  let presets = window.__PRESETS || [];
+  let configLoras = window.__CONFIG_LORAS || [];
+  let editingPresetId = null;  // null = creating new, string = editing existing
 
   // ─── DOM refs ───────────────────────────────────────────────
   const $ = (s) => document.querySelector(s);
@@ -33,57 +57,101 @@
   const previewImg = $("#preview-img");
   const dropText = $("#drop-text");
 
-  // ─── Slider value display + duration↔frames ─────────────────
-  function setupSliders() {
-    // Map: slider id → value display span id
-    const sliderMap = {
-      "width": "width-val",
-      "height": "height-val",
-      "duration": "duration-val",
-      "fps": "fps-val",
-      "steps": "steps-val",
-      "cfg": "cfg-val",
-      "cfg2": "cfg2-val",
-      "flow-shift": "flow-shift-val",
-      "output-fps": "output-fps-val",
-    };
+  // ─── Hybrid slider ↔ number sync ───────────────────────────
+  // Each hybrid pair: range slider + number input stay in sync.
+  // The number input allows precise typing; the slider gives quick drag.
 
-    for (const [sliderId, labelId] of Object.entries(sliderMap)) {
-      const slider = $(`#${sliderId}`);
-      const label = $(`#${labelId}`);
-      if (slider && label) {
-        slider.addEventListener("input", () => {
-          label.textContent = slider.value;
-          // Recalculate frames when duration or fps change
-          if (sliderId === "duration" || sliderId === "fps") {
-            updateFramesFromDuration();
-          }
-          if (sliderId === "fps" || sliderId === "output-fps") {
-            updateInterpHint();
-          }
-        });
-      }
+  const HYBRID_PAIRS = [
+    // [rangeSliderId, numberInputId]
+    ["width",              "width-num"],
+    ["height",             "height-num"],
+    ["duration",           "duration-num"],
+    ["fps",                "fps-num"],
+    ["output-fps",         "output-fps-num"],
+    ["steps",              "steps-num"],
+    ["cfg",                "cfg-num"],
+    ["cfg2",               "cfg2-num"],
+    ["flow-shift",         "flow-shift-num"],
+    ["boundary-ratio",     "boundary-ratio-num"],
+    ["num-blocks-per-group","num-blocks-per-group-num"],
+    ["target-duration",    "target-duration-num"],
+  ];
+
+  function setupHybridInputs() {
+    for (const [rangeId, numId] of HYBRID_PAIRS) {
+      const range = $(`#${rangeId}`);
+      const num = $(`#${numId}`);
+      if (!range || !num) continue;
+
+      // Slider → number
+      range.addEventListener("input", () => {
+        num.value = range.value;
+        onParamChange(rangeId);
+      });
+
+      // Number → slider
+      num.addEventListener("input", () => {
+        range.value = num.value;
+        onParamChange(rangeId);
+      });
+
+      // On blur, clamp number to slider min/max
+      num.addEventListener("blur", () => {
+        let v = parseFloat(num.value);
+        const mn = parseFloat(range.min);
+        const mx = parseFloat(range.max);
+        if (isNaN(v)) v = parseFloat(range.value);
+        v = Math.max(mn, Math.min(mx, v));
+        num.value = v;
+        range.value = v;
+        onParamChange(rangeId);
+      });
     }
 
-    // LoRA slider value displays
-    $$(".lora-scale").forEach(slider => {
-      slider.addEventListener("input", () => {
-        const valSpan = slider.parentElement.querySelector(".lora-val");
-        if (valSpan) valSpan.textContent = slider.value;
-      });
-    });
-
-    // Initialize computed values
-    updateFramesFromDuration();
-    updateInterpHint();
+    // LoRA hybrid pairs
+    setupLoraHybridInputs();
   }
 
+  function setupLoraHybridInputs() {
+    $$(".lora-scale").forEach(range => {
+      const idx = range.dataset.lora;
+      const num = $(`.lora-scale-num[data-lora="${idx}"]`);
+      if (!num) return;
+
+      range.addEventListener("input", () => { num.value = range.value; });
+      num.addEventListener("input", () => { range.value = num.value; });
+      num.addEventListener("blur", () => {
+        let v = parseFloat(num.value);
+        if (isNaN(v)) v = parseFloat(range.value);
+        v = Math.max(0, Math.min(5, v));
+        num.value = v;
+        range.value = v;
+      });
+    });
+  }
+
+  // Helper to set both range + number input for a param
+  function setParam(id, val) {
+    const range = $(`#${id}`);
+    const num = $(`#${id}-num`);
+    if (range) range.value = val;
+    if (num) num.value = val;
+  }
+
+  // Called when any parameter slider/number changes
+  function onParamChange(id) {
+    if (id === "duration" || id === "fps") updateFramesFromDuration();
+    if (id === "fps" || id === "output-fps") updateInterpHint();
+    if (id === "width" || id === "height") { updateMegapixels(); updateResDimLabel(); }
+    if (id === "steps") updateTotalSteps();
+    if (id === "target-duration" || id === "duration" || id === "fps") updateTargetDurationHint();
+  }
+
+  // ─── Computed values ────────────────────────────────────────
+
   function calcFrames4k1(duration, fps) {
-    // Wan 2.2 frame count rule: frames must be 4k+1
-    // frames = round(duration * fps), then snap to nearest 4k+1
     let raw = Math.round(duration * fps);
     if (raw < 5) raw = 5;
-    // Snap to 4k+1: frames = ((raw - 1) / 4) * 4 + 1
     let frames = Math.round((raw - 1) / 4) * 4 + 1;
     if (frames < 5) frames = 5;
     return frames;
@@ -100,16 +168,70 @@
   function updateInterpHint() {
     const fps = parseInt($("#fps").value) || 16;
     const outputFps = parseInt($("#output-fps").value) || fps;
+    const targetDur = parseFloat($("#target-duration")?.value) || 0;
     const hint = $("#interp-hint");
     if (!hint) return;
-    if (outputFps > fps) {
+
+    if (targetDur > 0) {
+      const duration = parseFloat($("#duration").value) || 5;
+      const sourceDur = (calcFrames4k1(duration, fps) - 1) / fps;
+      const speed = sourceDur / targetDur;
+      if (Math.abs(speed - 1) < 0.05) {
+        hint.textContent = `RIFE: ${fps}→${outputFps}fps`;
+        hint.style.color = "var(--success)";
+      } else if (speed > 1) {
+        hint.textContent = `RIFE: ${speed.toFixed(1)}× faster → ${targetDur}s`;
+        hint.style.color = "var(--warning, #d29922)";
+      } else {
+        hint.textContent = `RIFE: ${(1/speed).toFixed(1)}× slower → ${targetDur}s`;
+        hint.style.color = "var(--info, #58a6ff)";
+      }
+    } else if (outputFps > fps) {
       const ratio = Math.round(outputFps / fps);
-      hint.textContent = `RIFE: ${fps}→${outputFps}fps (~${ratio}×)`;
+      hint.textContent = `RIFE: ${fps}→${outputFps} (~${ratio}×)`;
       hint.style.color = "var(--success)";
     } else {
-      hint.textContent = `No interpolation (${fps}fps)`;
+      hint.textContent = `No interp (${fps}fps)`;
       hint.style.color = "var(--text-muted)";
     }
+  }
+
+  function updateTargetDurationHint() {
+    const hint = $("#target-duration-hint");
+    if (!hint) return;
+    const targetDur = parseFloat($("#target-duration")?.value) || 0;
+    if (targetDur <= 0) {
+      hint.textContent = "0 = keep original duration";
+      hint.style.color = "";
+      return;
+    }
+    const fps = parseInt($("#fps").value) || 16;
+    const duration = parseFloat($("#duration").value) || 5;
+    const sourceDur = (calcFrames4k1(duration, fps) - 1) / fps;
+    const speed = sourceDur / targetDur;
+    if (Math.abs(speed - 1) < 0.05) {
+      hint.textContent = `≈ original (${sourceDur.toFixed(1)}s)`;
+      hint.style.color = "";
+    } else if (speed > 1) {
+      hint.textContent = `${speed.toFixed(2)}× speed up (${sourceDur.toFixed(1)}s → ${targetDur}s)`;
+      hint.style.color = "var(--warning, #d29922)";
+    } else {
+      hint.textContent = `${(1/speed).toFixed(2)}× slow motion (${sourceDur.toFixed(1)}s → ${targetDur}s)`;
+      hint.style.color = "var(--info, #58a6ff)";
+    }
+  }
+
+  function updateMegapixels() {
+    const w = parseInt($("#width").value) || 832;
+    const h = parseInt($("#height").value) || 480;
+    const mp = (w * h / 1e6).toFixed(2);
+    const el = $("#mpx-computed");
+    if (el) el.textContent = mp;
+  }
+
+  function updateTotalSteps() {
+    // Steps value is now total steps (split between high & low by boundary ratio)
+    // No calculation needed — the UI value IS the total
   }
 
   // ─── Toast notification system ──────────────────────────────
@@ -119,7 +241,6 @@
     el.className = `toast toast-${type}`;
     el.textContent = message;
     container.appendChild(el);
-
     setTimeout(() => {
       el.classList.add("toast-out");
       setTimeout(() => el.remove(), 300);
@@ -156,13 +277,11 @@
     });
 
     evtSource.addEventListener("progress", (e) => {
-      const d = JSON.parse(e.data);
-      handleProgress(d);
+      handleProgress(JSON.parse(e.data));
     });
 
     evtSource.addEventListener("generation_complete", (e) => {
-      const d = JSON.parse(e.data);
-      handleComplete(d);
+      handleComplete(JSON.parse(e.data));
     });
 
     evtSource.onerror = () => {
@@ -172,7 +291,6 @@
   }
 
   function handleProgress(d) {
-    // Update progress bar
     const pFill = $("#progress-fill");
     const pMsg = $("#progress-msg");
     const pSec = $("#progress-section");
@@ -182,22 +300,15 @@
       pMsg.textContent = `[${d.step}] ${d.message}  (${d.percent.toFixed(1)}%)`;
     }
 
-    // Update step card
     const card = $(`.step-card[data-step="${d.step}"]`);
     if (card) {
       card.setAttribute("data-state", "running");
       card.querySelector(".step-status").textContent = "running";
-
-      // Per-step mini progress bar
       stepProgressData[d.step] = d.percent;
       const fill = card.querySelector(".step-progress-fill");
-      if (fill) {
-        // Map the overall percent range to step-local 0-100
-        fill.style.width = Math.min(100, d.percent) + "%";
-      }
+      if (fill) fill.style.width = Math.min(100, d.percent) + "%";
     }
 
-    // Update VRAM bars (sidebar + detail)
     if (d.vram && d.vram.allocated_gb !== undefined) {
       updateVRAM(d.vram);
       updateVRAMDetail(d.vram);
@@ -207,29 +318,26 @@
   function handleComplete(d) {
     stopTimer();
     stopAutoRefresh();
+    stopSessionLogPolling();
+
+    // Final fetch of session logs to capture summary
+    fetchSessionLogs();
 
     const session = d.session || {};
     const status = session.status || "done";
 
-    if (status === "done") {
-      toast("Generation complete! 🎉", "success");
-    } else if (status === "failed") {
-      toast("Generation failed: " + (session.error_message || "unknown error"), "error", 8000);
-    } else if (status === "cancelled") {
-      toast("Generation cancelled", "warning");
-    }
+    if (status === "done") toast("Generation complete! 🎉", "success");
+    else if (status === "failed") toast("Generation failed: " + (session.error_message || "unknown error"), "error", 8000);
+    else if (status === "cancelled") toast("Generation cancelled", "warning");
 
-    // Refresh session list and detail
     refreshSessions().then(() => {
-      if (d.session_id === currentSessionId) {
-        showSession(d.session_id);
-      }
+      if (d.session_id === currentSessionId) showSession(d.session_id);
     });
     btnCancel.style.display = "none";
     btnGenerate.disabled = false;
   }
 
-  // ─── VRAM (sidebar) ────────────────────────────────────────
+  // ─── VRAM ───────────────────────────────────────────────────
   function updateVRAM(v) {
     const fill = $(".vram-fill");
     const label = $(".vram-label");
@@ -239,27 +347,21 @@
     const pct = Math.min(100, (used / total) * 100);
     fill.style.width = pct + "%";
     label.textContent = `VRAM: ${used.toFixed(1)} / ${total.toFixed(1)} GB`;
-
-    // Color code
     if (pct > 85) fill.style.background = "linear-gradient(90deg, #f85149, #da3633)";
     else if (pct > 60) fill.style.background = "linear-gradient(90deg, #d29922, #e3b341)";
     else fill.style.background = "";
   }
 
-  // ─── VRAM detail bar (in session view) ──────────────────────
   function updateVRAMDetail(v) {
     const total = v.total_gb || 24;
     const allocated = v.allocated_gb || 0;
     const reserved = v.reserved_gb || 0;
-
     const allocPct = Math.min(100, (allocated / total) * 100);
     const resvPct = Math.min(100, (reserved / total) * 100);
-
     const allocBar = $(".vram-detail-allocated");
     const resvBar = $(".vram-detail-reserved");
     if (allocBar) allocBar.style.width = allocPct + "%";
     if (resvBar) resvBar.style.width = resvPct + "%";
-
     const al = $(".vram-alloc-label");
     const rl = $(".vram-reserved-label");
     const tl = $(".vram-total-label");
@@ -275,7 +377,7 @@
     }).catch(() => {});
   }
 
-  // ─── Timer (elapsed + ETA) ─────────────────────────────────
+  // ─── Timer ──────────────────────────────────────────────────
   function startTimer() {
     generationStartTime = Date.now();
     const timerBar = $("#timer-bar");
@@ -292,11 +394,8 @@
   function updateTimerDisplay() {
     if (!generationStartTime) return;
     const elapsed = Math.floor((Date.now() - generationStartTime) / 1000);
-    const elapsedStr = formatDuration(elapsed);
     const el = $("#timer-elapsed");
-    if (el) el.textContent = `⏱ ${elapsedStr}`;
-
-    // Estimate ETA from overall progress fill
+    if (el) el.textContent = `⏱ ${formatDuration(elapsed)}`;
     const pFill = $("#progress-fill");
     if (pFill) {
       const pct = parseFloat(pFill.style.width) || 0;
@@ -315,7 +414,7 @@
     return `${m}:${s.toString().padStart(2, "0")}`;
   }
 
-  // ─── Auto-refresh during running session ────────────────────
+  // ─── Auto-refresh ───────────────────────────────────────────
   function startAutoRefresh() {
     stopAutoRefresh();
     autoRefreshInterval = setInterval(() => {
@@ -324,11 +423,8 @@
           .then(r => r.json())
           .then(s => {
             if (s.session_id) renderSessionDetail(s);
-            if (s.status !== "running") {
-              stopAutoRefresh();
-            }
-          })
-          .catch(() => {});
+            if (s.status !== "running") stopAutoRefresh();
+          }).catch(() => {});
       }
     }, 3000);
   }
@@ -344,9 +440,8 @@
     lastLogTs = 0;
     const logContent = $("#log-content");
     if (logContent) logContent.innerHTML = "";
-
     logPollInterval = setInterval(fetchLogs, 2000);
-    fetchLogs(); // immediate first fetch
+    fetchLogs();
   }
 
   function stopLogPolling() {
@@ -361,7 +456,6 @@
         if (!lines.length) return;
         const logContent = $("#log-content");
         if (!logContent) return;
-
         for (const line of lines) {
           const span = document.createElement("span");
           span.className = "log-line";
@@ -372,11 +466,82 @@
           logContent.appendChild(document.createTextNode("\n"));
           if (line.ts > lastLogTs) lastLogTs = line.ts;
         }
-
-        // Auto-scroll to bottom
         logContent.scrollTop = logContent.scrollHeight;
-      })
-      .catch(() => {});
+      }).catch(() => {});
+  }
+
+  // ─── Session Log Files (generation.log / vram.log) ──────────
+  let sessionLogPollInterval = null;
+
+  function setupSessionLogTabs() {
+    document.addEventListener("click", (e) => {
+      if (e.target.classList.contains("session-log-tab")) {
+        const tab = e.target.getAttribute("data-logtab");
+        $$(".session-log-tab").forEach(t => t.classList.toggle("active", t.getAttribute("data-logtab") === tab));
+        $$(".session-log-content").forEach(c => c.classList.toggle("active", c.getAttribute("data-logtab") === tab));
+      }
+    });
+
+    const refreshBtn = $("#btn-refresh-logs");
+    if (refreshBtn) refreshBtn.addEventListener("click", () => fetchSessionLogs());
+  }
+
+  function fetchSessionLogs() {
+    if (!currentSessionId) return;
+
+    fetch(`/api/sessions/${currentSessionId}/generation_log`)
+      .then(r => r.json())
+      .then(d => {
+        const el = $("#gen-log-content");
+        if (el) {
+          el.textContent = d.content || "(empty)";
+          // Auto-scroll to bottom if user hasn't scrolled up
+          if (el.scrollHeight - el.scrollTop - el.clientHeight < 100) {
+            el.scrollTop = el.scrollHeight;
+          }
+        }
+        // Show section if log exists
+        const sec = $("#session-logs-section");
+        if (sec && d.exists) sec.style.display = "block";
+      }).catch(() => {});
+
+    fetch(`/api/sessions/${currentSessionId}/vram_log`)
+      .then(r => r.json())
+      .then(d => {
+        const el = $("#vram-log-content");
+        if (el) {
+          el.textContent = d.content || "(empty)";
+          if (el.scrollHeight - el.scrollTop - el.clientHeight < 100) {
+            el.scrollTop = el.scrollHeight;
+          }
+        }
+        const sec = $("#session-logs-section");
+        if (sec && d.exists) sec.style.display = "block";
+      }).catch(() => {});
+  }
+
+  function startSessionLogPolling() {
+    stopSessionLogPolling();
+    fetchSessionLogs();
+    sessionLogPollInterval = setInterval(fetchSessionLogs, 5000);
+  }
+
+  function stopSessionLogPolling() {
+    if (sessionLogPollInterval) clearInterval(sessionLogPollInterval);
+    sessionLogPollInterval = null;
+  }
+
+  function updateSessionLogDownloadLinks(sid) {
+    const genDl = $("#btn-dl-gen-log");
+    const vramDl = $("#btn-dl-vram-log");
+    if (genDl) {
+      genDl.href = `/sessions/${sid}/generation.log`;
+      genDl.download = `${sid.slice(0, 8)}_generation.log`;
+    }
+    if (vramDl) {
+      vramDl.href = `/sessions/${sid}/vram.log`;
+      vramDl.download = `${sid.slice(0, 8)}_vram.log`;
+    }
   }
 
   // ─── Sessions ───────────────────────────────────────────────
@@ -385,9 +550,7 @@
       const r = await fetch("/api/sessions");
       sessions = await r.json();
       renderSessionList();
-    } catch (e) {
-      console.error("Failed to refresh sessions:", e);
-    }
+    } catch (e) { console.error("Failed to refresh sessions:", e); }
   }
 
   function renderSessionList() {
@@ -398,11 +561,8 @@
       const date = new Date(s.created_at * 1000);
       const dateStr = date.toLocaleString();
       const prompt = s.prompt || "(no prompt)";
-
-      // Thumbnail: check if input.png exists in session
       const thumbUrl = `/sessions/${s.session_id}/input.png`;
       const thumbHtml = `<img class="si-thumb" src="${thumbUrl}" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="si-thumb-placeholder" style="display:none">🎬</div>`;
-
       div.innerHTML = `
         ${thumbHtml}
         <div class="si-details">
@@ -422,7 +582,6 @@
   async function showSession(sid) {
     currentSessionId = sid;
     renderSessionList();
-
     try {
       const r = await fetch(`/api/sessions/${sid}`);
       if (!r.ok) return;
@@ -431,64 +590,74 @@
       panelGen.style.display = "none";
       panelSession.style.display = "block";
 
-      // Start auto-refresh and log polling if running
+      // Update log download links and fetch logs
+      updateSessionLogDownloadLinks(sid);
+      fetchSessionLogs();
+
       if (s.status === "running") {
         startAutoRefresh();
         startLogPolling();
+        startSessionLogPolling();
         startTimer();
       } else {
         stopAutoRefresh();
         stopLogPolling();
+        stopSessionLogPolling();
         stopTimer();
       }
-    } catch (e) {
-      console.error(e);
-    }
+    } catch (e) { console.error(e); }
   }
 
   function renderSessionDetail(s) {
     $("#session-title").textContent = `Session ${s.session_id.slice(0, 8)}`;
 
-    // Steps
     const steps = s.steps || {};
     $$(".step-card").forEach(card => {
       const step = card.getAttribute("data-step");
       const status = steps[step] || "pending";
       card.setAttribute("data-state", status);
       card.querySelector(".step-status").textContent = status;
-
-      // Per-step mini progress: set to 100% if done, 0% if pending
       const fill = card.querySelector(".step-progress-fill");
       if (fill) {
-        if (status === "done" || status === "skipped") {
-          fill.style.width = "100%";
-        } else if (status === "running" && stepProgressData[step] !== undefined) {
-          fill.style.width = Math.min(100, stepProgressData[step]) + "%";
-        } else if (status === "pending") {
-          fill.style.width = "0%";
-        }
+        if (status === "done" || status === "skipped") fill.style.width = "100%";
+        else if (status === "running" && stepProgressData[step] !== undefined) fill.style.width = Math.min(100, stepProgressData[step]) + "%";
+        else if (status === "pending") fill.style.width = "0%";
       }
-
-      // Show timing if available
       const timeEl = card.querySelector(".step-time");
-      if (s.step_times && s.step_times[step]) {
-        timeEl.textContent = formatStepTime(s.step_times[step]);
-      } else {
-        timeEl.textContent = "";
+      if (s.step_times && s.step_times[step]) timeEl.textContent = formatStepTime(s.step_times[step]);
+      else timeEl.textContent = "";
+
+      // Ensure upscale model dropdown reflects session state ONLY if not focused
+      // Prevents overwriting user selection while they're changing it
+      if (step === "upscale" && s.upscale_model) {
+        const uSelect = card.querySelector("select");
+        if (uSelect && document.activeElement !== uSelect) {
+            uSelect.value = s.upscale_model;
+        }
+        // Also populate fps and duration controls from session
+        const fpsInput = card.querySelector(".upscale-step-fps");
+        if (fpsInput && document.activeElement !== fpsInput) {
+          fpsInput.value = s.output_fps || 24;
+        }
+        const durInput = card.querySelector(".upscale-step-duration");
+        if (durInput && document.activeElement !== durInput) {
+          durInput.value = s.target_duration || 0;
+        }
       }
     });
 
-    // Info
     $("#info-prompt").textContent = s.prompt || "—";
     const durStr = s.duration ? `${s.duration}s` : "";
     const outFpsStr = s.output_fps && s.output_fps !== s.fps ? ` → ${s.output_fps}fps` : "";
-    $("#info-size").textContent = `${s.width}×${s.height}, ${s.num_frames}f ${durStr} @ ${s.fps}fps${outFpsStr}`;
-    $("#info-steps").textContent = s.num_inference_steps;
+    const tgtDurStr = s.target_duration && s.target_duration > 0 ? ` (target: ${s.target_duration}s)` : "";
+    $("#info-size").textContent = `${s.width}×${s.height}, ${s.num_frames}f ${durStr} @ ${s.fps}fps${outFpsStr}${tgtDurStr}`;
+    const modeStr = s.distill_lora_mode ? "⚡ Fast" : "🎨 Quality";
+    const presetStr = s.preset_name ? ` | Preset: ${s.preset_name}` : "";
+    $("#info-steps").textContent = `${s.num_inference_steps} (${modeStr}${presetStr})`;
     $("#info-seed").textContent = s.seed;
     $("#info-cfg").textContent = `${s.guidance_scale} / ${s.guidance_scale_2 || "—"}`;
     $("#info-status").textContent = s.status;
 
-    // Error
     const errorRow = $("#info-error-row");
     const errorEl = $("#info-error");
     if (s.error_message) {
@@ -498,7 +667,6 @@
       errorRow.style.display = "none";
     }
 
-    // Progress
     if (s.status === "running") {
       $("#progress-section").style.display = "block";
       btnCancel.style.display = "inline-flex";
@@ -509,7 +677,6 @@
       $("#timer-bar").style.display = "none";
     }
 
-    // Input image in session detail
     const inputImgSection = $("#input-image-section");
     const sessionImg = $("#session-input-img");
     const inputImgUrl = `/sessions/${s.session_id}/input.png`;
@@ -517,7 +684,6 @@
     sessionImg.onerror = () => { inputImgSection.style.display = "none"; };
     sessionImg.onload = () => { inputImgSection.style.display = "block"; };
 
-    // Video section with tabs
     renderVideoSection(s);
   }
 
@@ -537,33 +703,25 @@
     const origSrc = `/sessions/${s.session_id}/${videoFile}`;
     const upSrc = `/sessions/${s.session_id}/output_upscaled.mp4`;
 
-    // Original player
-    const player = $("#video-player");
-    player.src = origSrc;
+    $("#video-player").src = origSrc;
     const dlBtn = $("#video-download");
     dlBtn.href = origSrc;
     dlBtn.download = `${s.session_id.slice(0,8)}_${videoFile}`;
 
-    // Upscaled tab + player
     const tabUp = $("#tab-upscaled");
     const tabCompare = $("#tab-compare");
     if (hasUpscaled) {
       tabUp.style.display = "";
       tabCompare.style.display = "";
-
-      const playerUp = $("#video-player-upscaled");
-      playerUp.src = upSrc;
+      $("#video-player-upscaled").src = upSrc;
       const dlUp = $("#video-download-upscaled");
       dlUp.href = upSrc;
       dlUp.download = `${s.session_id.slice(0,8)}_upscaled.mp4`;
-
-      // Comparison videos
       $("#video-compare-orig").src = origSrc;
       $("#video-compare-up").src = upSrc;
     } else {
       tabUp.style.display = "none";
       tabCompare.style.display = "none";
-      // Reset to original tab if on hidden tab
       activateVideoTab("original");
     }
   }
@@ -583,33 +741,24 @@
   // ─── Image Upload ───────────────────────────────────────────
   function setupDropZone() {
     dropZone.addEventListener("click", () => fileInput.click());
-
     dropZone.addEventListener("dragover", (e) => {
       e.preventDefault();
       dropZone.classList.add("drag-over");
     });
-    dropZone.addEventListener("dragleave", () => {
-      dropZone.classList.remove("drag-over");
-    });
+    dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over"));
     dropZone.addEventListener("drop", (e) => {
       e.preventDefault();
       dropZone.classList.remove("drag-over");
-      if (e.dataTransfer.files.length > 0) {
-        uploadFile(e.dataTransfer.files[0]);
-      }
+      if (e.dataTransfer.files.length > 0) uploadFile(e.dataTransfer.files[0]);
     });
-
     fileInput.addEventListener("change", () => {
-      if (fileInput.files.length > 0) {
-        uploadFile(fileInput.files[0]);
-      }
+      if (fileInput.files.length > 0) uploadFile(fileInput.files[0]);
     });
   }
 
   async function uploadFile(file) {
     const fd = new FormData();
     fd.append("image", file);
-
     try {
       const r = await fetch("/api/upload", { method: "POST", body: fd });
       const d = await r.json();
@@ -619,6 +768,8 @@
         previewImg.style.display = "block";
         dropText.style.display = "none";
         toast("Image uploaded", "success", 2000);
+        // Auto-detect aspect ratio and adjust width/height
+        autoAdjustAspectRatio(`/input/${d.filename}`);
       } else {
         toast("Upload failed: " + (d.error || "unknown"), "error");
       }
@@ -627,67 +778,168 @@
     }
   }
 
+  /**
+   * Auto-adjust width/height sliders to match the aspect ratio of the
+   * uploaded image, keeping dimensions as multiples of 16 within the
+   * allowed ranges (width: 256-1920, height: 256-1080).
+   */
+  function autoAdjustAspectRatio(imageUrl) {
+    const img = new Image();
+    img.onload = () => {
+      const iw = img.naturalWidth;
+      const ih = img.naturalHeight;
+      if (!iw || !ih) return;
+
+      const aspect = iw / ih;   // > 1 = landscape, < 1 = portrait
+
+      // Constraints
+      const MIN_W = 256, MAX_W = 1920;
+      const MIN_H = 256, MAX_H = 1080;
+      const STEP = 16;
+
+      // Strategy: try all valid widths (mod 16) and find matching height
+      // that best preserves aspect ratio while staying in range.
+      let bestW = 832, bestH = 480, bestErr = Infinity;
+
+      for (let w = MIN_W; w <= MAX_W; w += STEP) {
+        let h = Math.round(w / aspect / STEP) * STEP;
+        if (h < MIN_H) h = MIN_H;
+        if (h > MAX_H) h = MAX_H;
+        const err = Math.abs((w / h) - aspect);
+        if (err < bestErr) {
+          bestErr = err;
+          bestW = w;
+          bestH = h;
+        }
+      }
+
+      setParam("width", bestW);
+      setParam("height", bestH);
+      onParamChange("width");
+      onParamChange("height");
+      updateResDimLabel();
+      toast(`Aspect ratio detected (${iw}×${ih}) → ${bestW}×${bestH}`, "info", 3000);
+    };
+    img.src = imageUrl;
+  }
+
+  // ─── Resolution scaling ─────────────────────────────────────
+  /**
+   * Scale width & height by a percentage while preserving aspect ratio.
+   * Snaps to multiples of 16 and clamps within the allowed ranges.
+   */
+  function scaleResolution(pct) {
+    const curW = parseInt($("#width").value) || 832;
+    const curH = parseInt($("#height").value) || 480;
+    const factor = 1 + pct / 100;
+
+    const MIN_W = 256, MAX_W = 1920;
+    const MIN_H = 256, MAX_H = 1080;
+    const STEP = 16;
+
+    let newW = Math.round(curW * factor / STEP) * STEP;
+    let newH = Math.round(curH * factor / STEP) * STEP;
+
+    // Clamp
+    newW = Math.max(MIN_W, Math.min(MAX_W, newW));
+    newH = Math.max(MIN_H, Math.min(MAX_H, newH));
+
+    // If one dimension hit the clamp, adjust the other to preserve aspect ratio
+    const aspect = curW / curH;
+    if (newW === MIN_W || newW === MAX_W) {
+      newH = Math.round(newW / aspect / STEP) * STEP;
+      newH = Math.max(MIN_H, Math.min(MAX_H, newH));
+    } else if (newH === MIN_H || newH === MAX_H) {
+      newW = Math.round(newH * aspect / STEP) * STEP;
+      newW = Math.max(MIN_W, Math.min(MAX_W, newW));
+    }
+
+    setParam("width", newW);
+    setParam("height", newH);
+    onParamChange("width");
+    onParamChange("height");
+    updateResDimLabel();
+  }
+
+  function updateResDimLabel() {
+    const el = $("#res-scale-dim");
+    if (el) el.textContent = `${$("#width").value}×${$("#height").value}`;
+  }
+
+  // Bind scale buttons
+  document.querySelectorAll(".res-scale-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      scaleResolution(parseInt(btn.dataset.scale));
+    });
+  });
+
   // ─── Clone session ─────────────────────────────────────────
   async function cloneSession() {
     if (!currentSessionId) return;
-
     try {
       const r = await fetch(`/api/sessions/${currentSessionId}/clone`, { method: "POST" });
       const d = await r.json();
-      if (d.error) {
-        toast("Clone failed: " + d.error, "error");
-        return;
-      }
+      if (d.error) { toast("Clone failed: " + d.error, "error"); return; }
 
-      // Fill the generate form with cloned params
       $("#prompt").value = d.prompt || "";
       $("#negative-prompt").value = d.negative_prompt || "";
-
-      // Update sliders + their value labels
-      function setSlider(id, val) {
-        const el = $(`#${id}`);
-        if (el) el.value = val;
-        const label = $(`#${id}-val`);
-        if (label) label.textContent = val;
-      }
-      setSlider("width", d.width || 832);
-      setSlider("height", d.height || 480);
-      setSlider("duration", d.duration || 5.0);
-      setSlider("fps", d.fps || 16);
-      setSlider("steps", d.num_inference_steps || 8);
-      setSlider("cfg", d.guidance_scale || 2.0);
-      setSlider("cfg2", d.guidance_scale_2 || 2.0);
-      setSlider("flow-shift", d.flow_shift || 8.0);
-      setSlider("output-fps", d.output_fps || 24);
+      setParam("width", d.width || 832);
+      setParam("height", d.height || 480);
+      setParam("duration", d.duration || 5.0);
+      setParam("fps", d.fps || 16);
+      setParam("steps", d.num_inference_steps || 20);
+      setParam("cfg", d.guidance_scale || 5.0);
+      setParam("cfg2", d.guidance_scale_2 || 5.0);
+      setParam("flow-shift", d.flow_shift || 8.0);
+      setParam("output-fps", d.output_fps || 24);
+      setParam("target-duration", d.target_duration || 0);
+      setParam("boundary-ratio", d.boundary_ratio || 0.9);
       $("#seed").value = d.seed || 42;
       $("#enable-upscale").checked = d.enable_upscale || false;
+      if (d.upscale_model && $("#upscale-model")) {
+        $("#upscale-model").value = d.upscale_model;
+      }
 
-      // Update computed values
+      // Restore mode toggle based on session's distill_lora_mode
+      applyMode(d.distill_lora_mode ? "fast" : "quality", /* silent */ true);
+
+      // Restore preset selection if session used one
+      if (d.preset_id) {
+        const presetSel = $("#preset-select");
+        if (presetSel) presetSel.value = d.preset_id;
+        $("#preset-id").value = d.preset_id;
+        updatePresetInfo(d.preset_id);
+      } else {
+        const presetSel = $("#preset-select");
+        if (presetSel) presetSel.value = "";
+        $("#preset-id").value = "";
+        updatePresetInfo("");
+      }
+
       updateFramesFromDuration();
       updateInterpHint();
+      updateMegapixels();
+      updateTotalSteps();
+      updateTargetDurationHint();
 
-      // Update LoRA scales
       if (d.lora_scales && d.lora_scales.length) {
-        const loraInputs = $$(".lora-scale");
+        const loraRanges = $$(".lora-scale");
+        const loraNums = $$(".lora-scale-num");
         d.lora_scales.forEach((val, i) => {
-          if (loraInputs[i]) {
-            loraInputs[i].value = val;
-            const valSpan = loraInputs[i].parentElement.querySelector(".lora-val");
-            if (valSpan) valSpan.textContent = val;
-          }
+          if (loraRanges[i]) loraRanges[i].value = val;
+          if (loraNums[i]) loraNums[i].value = val;
         });
       }
 
-      // If there's an input image URL, show it
       if (d.input_image_url) {
         previewImg.src = d.input_image_url;
         previewImg.style.display = "block";
         dropText.style.display = "none";
-        // Note: input_image_path needs to be set from the original session
-        // For clone, we keep the path empty — user needs to re-upload or
-        // we copy the image from the session
-        $("#input-image-path").value = "";
-        toast("Parameters cloned — please upload/confirm input image", "info", 5000);
+        // Use the original input_image path so validation passes
+        $("#input-image-path").value = d.input_image || "";
+        if (!d.input_image) {
+          toast("Parameters cloned — please upload/confirm input image", "info", 5000);
+        }
       }
 
       showGeneratePanel();
@@ -697,36 +949,123 @@
     }
   }
 
+  // ─── Mode Toggle (Quality / Fast) ──────────────────────────
+  // Quality mode: no distill LoRAs, full CFG, 20 steps
+  // Fast mode: LightX2V distill LoRAs, CFG=1.0, 4 steps, flow_shift=5.0
+  let currentMode = "quality";
+
+  // Presets store the values that were active before switching
+  const QUALITY_DEFAULTS = { steps: 20, cfg: 5.0, cfg2: 5.0, flowShift: 8.0, boundaryRatio: 0.9 };
+  const FAST_DEFAULTS    = { steps: 4,  cfg: 1.0, cfg2: 1.0, flowShift: 5.0, boundaryRatio: 0.9 };
+
+  function setupModeToggle() {
+    const qualBtn = $("#mode-quality");
+    const fastBtn = $("#mode-fast");
+    if (!qualBtn || !fastBtn) return;
+
+    qualBtn.addEventListener("click", () => applyMode("quality"));
+    fastBtn.addEventListener("click", () => applyMode("fast"));
+
+    // Initial state: quality mode, disable distill LoRA cards
+    applyMode("quality", /* silent */ true);
+  }
+
+  function applyMode(mode, silent) {
+    currentMode = mode;
+    const qualBtn = $("#mode-quality");
+    const fastBtn = $("#mode-fast");
+    const hint = $("#mode-hint");
+
+    // Toggle active buttons
+    if (qualBtn) qualBtn.classList.toggle("active", mode === "quality");
+    if (fastBtn) fastBtn.classList.toggle("active", mode === "fast");
+
+    // Update hint text
+    if (hint) {
+      if (mode === "quality") {
+        hint.textContent = "Quality mode: 20 steps, CFG=5.0, quality LoRAs only";
+      } else {
+        hint.textContent = "Fast mode: 4 steps, no CFG (baked in), LightX2V distill — ~10× faster";
+      }
+    }
+
+    // Apply preset values
+    const preset = mode === "fast" ? FAST_DEFAULTS : QUALITY_DEFAULTS;
+    setParam("steps", preset.steps);
+    setParam("cfg", preset.cfg);
+    setParam("cfg2", preset.cfg2);
+    setParam("flow-shift", preset.flowShift);
+    setParam("boundary-ratio", preset.boundaryRatio);
+
+    // Enable/disable distill LoRA cards
+    $$(".lora-card").forEach(card => {
+      if (card.dataset.role === "distill") {
+        if (mode === "quality") {
+          card.classList.add("lora-disabled");
+        } else {
+          card.classList.remove("lora-disabled");
+        }
+      }
+    });
+
+    // Update computed displays
+    updateTotalSteps();
+
+    if (!silent) {
+      toast(mode === "quality"
+        ? "🎨 Quality mode — distill LoRAs disabled, full CFG"
+        : "⚡ Fast mode — LightX2V distill, CFG=1.0, 4 steps",
+        "info", 3000);
+    }
+  }
+
   // ─── Generate ───────────────────────────────────────────────
   function gatherParams() {
-    const loraInputs = $$(".lora-scale");
+    const loraRanges = $$(".lora-scale");
     const loraScales = [];
-    loraInputs.forEach(inp => {
-      loraScales.push(parseFloat(inp.value) || 0);
-    });
+    loraRanges.forEach(inp => loraScales.push(parseFloat(inp.value) || 0));
 
     const duration = parseFloat($("#duration").value) || 5;
     const fps = parseInt($("#fps").value) || 16;
     const numFrames = calcFrames4k1(duration, fps);
 
-    return {
-      prompt: $("#prompt").value,
-      negative_prompt: $("#negative-prompt").value,
-      input_image: $("#input-image-path").value,
-      width: parseInt($("#width").value),
-      height: parseInt($("#height").value),
-      num_frames: numFrames,
-      fps: fps,
-      duration: duration,
-      output_fps: parseInt($("#output-fps").value) || fps,
+    const params = {
+      prompt:              $("#prompt").value,
+      negative_prompt:     $("#negative-prompt").value,
+      input_image:         $("#input-image-path").value,
+      width:               parseInt($("#width").value),
+      height:              parseInt($("#height").value),
+      num_frames:          numFrames,
+      fps:                 fps,
+      duration:            duration,
+      output_fps:          parseInt($("#output-fps").value) || fps,
+      target_duration:     parseFloat($("#target-duration")?.value) || 0,
       num_inference_steps: parseInt($("#steps").value),
-      guidance_scale: parseFloat($("#cfg").value),
-      guidance_scale_2: parseFloat($("#cfg2").value),
-      flow_shift: parseFloat($("#flow-shift").value),
-      seed: parseInt($("#seed").value),
-      enable_upscale: $("#enable-upscale").checked,
-      lora_scales: loraScales,
+      guidance_scale:      parseFloat($("#cfg").value),
+      guidance_scale_2:    parseFloat($("#cfg2").value),
+      flow_shift:          parseFloat($("#flow-shift").value),
+      boundary_ratio:      parseFloat($("#boundary-ratio").value),
+      seed:                parseInt($("#seed").value),
+      enable_upscale:      $("#enable-upscale").checked,
+      upscale_model:       $("#upscale-model") ? $("#upscale-model").value : "",
+      lora_scales:         loraScales,
+      distill_lora_mode:   currentMode === "fast",
+      // Memory settings
+      offload_type:        $("#offload-type") ? $("#offload-type").value : "block_level",
+      num_blocks_per_group: parseInt($("#num-blocks-per-group")?.value) || 1,
+      enable_group_offload: $("#enable-group-offload")?.checked ?? true,
+      vae_tiling:          $("#vae-tiling")?.checked ?? true,
+      vae_slicing:         $("#vae-slicing")?.checked ?? true,
+      force_vae_cpu:       $("#force-vae-cpu")?.checked ?? false,
     };
+
+    // Include preset_id if one is selected
+    const presetId = $("#preset-id")?.value || "";
+    if (presetId) {
+      params.preset_id = presetId;
+    }
+
+    return params;
   }
 
   async function startGeneration() {
@@ -741,7 +1080,6 @@
     }
 
     btnGenerate.disabled = true;
-
     try {
       const r = await fetch("/api/generate", {
         method: "POST",
@@ -757,14 +1095,13 @@
 
       toast("Generation started!", "info");
       stepProgressData = {};
-
-      // Switch to session view
       currentSessionId = d.session_id;
       await refreshSessions();
       showSession(d.session_id);
       startTimer();
       startAutoRefresh();
       startLogPolling();
+      startSessionLogPolling();
     } catch (e) {
       toast("Request failed: " + e.message, "error");
       btnGenerate.disabled = false;
@@ -773,35 +1110,70 @@
 
   async function resumeFromStep(step) {
     if (!currentSessionId) return;
-
-    // Confirmation before overwrite — warn about downstream checkpoints
     const stepOrder = ["encode", "denoise", "vae_decode", "export", "upscale"];
     const stepIdx = stepOrder.indexOf(step);
     const downstreamSteps = stepOrder.slice(stepIdx).join(", ");
     const confirmed = confirm(
-      `Resume from "${step}"?\n\n` +
-      `This will re-run: ${downstreamSteps}\n` +
-      `Any existing checkpoints for these steps will be overwritten.`
+      `Resume from "${step}"?\n\nThis will re-run: ${downstreamSteps}\nAny existing checkpoints for these steps will be overwritten.`
     );
     if (!confirmed) return;
-
     try {
+      // Always send current UI state for enable_upscale so the session
+      // gets updated — covers the case where the user forgot to check
+      // upscale initially but wants it on resume.
+      const payload = { from_step: step };
+      const upscaleCheckbox = $("#enable-upscale");
+
+      // If resuming specifically from "upscale", force it on — the user
+      // clearly wants to upscale if they clicked play on that step.
+      if (step === "upscale") {
+        payload.enable_upscale = true;
+        if (upscaleCheckbox) upscaleCheckbox.checked = true;
+      } else if (upscaleCheckbox) {
+        payload.enable_upscale = upscaleCheckbox.checked;
+      }
+
+      // Also send the current upscale model selection
+      // Priority: Dropdown in the upscale step card > Main panel dropdown
+      const stepUpscaleSelect = $('.step-card[data-step="upscale"] select');
+      const mainUpscaleSelect = $("#upscale-model");
+      
+      if (stepUpscaleSelect) {
+        payload.upscale_model = stepUpscaleSelect.value;
+      } else if (mainUpscaleSelect) {
+        payload.upscale_model = mainUpscaleSelect.value;
+      }
+
+      // Send output_fps and target_duration from step card controls if available
+      const stepFpsInput = $('.step-card[data-step="upscale"] .upscale-step-fps');
+      const stepDurInput = $('.step-card[data-step="upscale"] .upscale-step-duration');
+      
+      if (stepFpsInput) {
+        payload.output_fps = parseInt(stepFpsInput.value) || 24;
+      } else {
+        payload.output_fps = parseInt($("#output-fps")?.value) || 24;
+      }
+      
+      if (stepDurInput) {
+        payload.target_duration = parseFloat(stepDurInput.value) || 0;
+      } else {
+        payload.target_duration = parseFloat($("#target-duration")?.value) || 0;
+      }
+
       const r = await fetch(`/api/resume/${currentSessionId}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ from_step: step }),
+        body: JSON.stringify(payload),
       });
       const d = await r.json();
-      if (d.error) {
-        toast("Error: " + d.error, "error");
-        return;
-      }
+      if (d.error) { toast("Error: " + d.error, "error"); return; }
       toast(`Resuming from ${step}…`, "info");
       stepProgressData = {};
       btnCancel.style.display = "inline-flex";
       startTimer();
       startAutoRefresh();
       startLogPolling();
+      startSessionLogPolling();
       showSession(currentSessionId);
     } catch (e) {
       toast("Resume failed: " + e.message, "error");
@@ -809,18 +1181,13 @@
   }
 
   async function cancelGeneration() {
-    try {
-      await fetch("/api/cancel", { method: "POST" });
-      toast("Cancel requested…", "warning");
-    } catch (e) {
-      console.error(e);
-    }
+    try { await fetch("/api/cancel", { method: "POST" }); toast("Cancel requested…", "warning"); }
+    catch (e) { console.error(e); }
   }
 
   async function deleteSession() {
     if (!currentSessionId) return;
     if (!confirm("Delete this session and all its files?")) return;
-
     try {
       await fetch(`/api/sessions/${currentSessionId}`, { method: "DELETE" });
       toast("Session deleted", "info");
@@ -839,32 +1206,29 @@
     currentSessionId = null;
     stopAutoRefresh();
     stopLogPolling();
+    stopSessionLogPolling();
     stopTimer();
     renderSessionList();
+    const logSec = $("#session-logs-section");
+    if (logSec) logSec.style.display = "none";
   }
 
   // ─── Keyboard shortcuts ─────────────────────────────────────
   function setupKeyboardShortcuts() {
     document.addEventListener("keydown", (e) => {
-      // Don't trigger shortcuts when typing in inputs
       const tag = e.target.tagName.toLowerCase();
       const isInput = tag === "input" || tag === "textarea" || tag === "select";
 
-      // Enter to generate (only when generate panel is visible and not in input)
       if (e.key === "Enter" && !isInput && panelGen.style.display !== "none") {
         e.preventDefault();
         startGeneration();
         return;
       }
-
-      // Escape to cancel
       if (e.key === "Escape") {
         e.preventDefault();
         cancelGeneration();
         return;
       }
-
-      // Ctrl+N to show new generation panel
       if (e.ctrlKey && e.key === "n") {
         e.preventDefault();
         showGeneratePanel();
@@ -879,15 +1243,10 @@
       if (e.target.classList.contains("video-tab")) {
         const tab = e.target.getAttribute("data-tab");
         activateVideoTab(tab);
-
-        // Sync playback for comparison
         if (tab === "compare") {
           const orig = $("#video-compare-orig");
           const up = $("#video-compare-up");
-          if (orig && up) {
-            orig.currentTime = 0;
-            up.currentTime = 0;
-          }
+          if (orig && up) { orig.currentTime = 0; up.currentTime = 0; }
         }
       }
     });
@@ -900,14 +1259,470 @@
     return d.innerHTML;
   }
 
+  function basename(path) {
+    if (!path) return "";
+    return path.split("/").pop();
+  }
+
+  // ─── Model Presets ─────────────────────────────────────────
+  function setupPresets() {
+    const sel = $("#preset-select");
+    const btnApply = $("#btn-preset-apply");
+    const btnEdit = $("#btn-preset-edit");
+    const btnNew = $("#btn-preset-new");
+    const btnDel = $("#btn-preset-delete");
+
+    if (!sel) return;
+
+    sel.addEventListener("change", () => {
+      const pid = sel.value;
+      updatePresetInfo(pid);
+      btnDel.style.display = pid ? "inline-flex" : "none";
+    });
+
+    btnApply.addEventListener("click", () => applyPreset(sel.value));
+    btnEdit.addEventListener("click", () => {
+      const pid = sel.value;
+      if (pid) openPresetEditor(pid);
+      else toast("Select a preset to edit", "warning");
+    });
+    btnNew.addEventListener("click", () => openPresetEditor(null));
+    btnDel.addEventListener("click", () => deletePresetUI(sel.value));
+
+    // Editor buttons
+    $("#preset-editor-close")?.addEventListener("click", closePresetEditor);
+    $("#pe-cancel")?.addEventListener("click", closePresetEditor);
+    $("#pe-save")?.addEventListener("click", savePreset);
+    $("#pe-lora-add")?.addEventListener("click", () => addLoraRow());
+
+    // Close modal on overlay click
+    $("#preset-editor-overlay")?.addEventListener("click", (e) => {
+      if (e.target.id === "preset-editor-overlay") closePresetEditor();
+    });
+
+    // Show info for default selection
+    updatePresetInfo(sel.value);
+  }
+
+  function updatePresetInfo(presetId) {
+    const infoDiv = $("#preset-info");
+    const badge = $("#preset-active-name");
+    if (!presetId) {
+      if (infoDiv) infoDiv.style.display = "none";
+      if (badge) badge.textContent = "";
+      return;
+    }
+
+    const preset = presets.find(p => p.id === presetId);
+    if (!preset) {
+      if (infoDiv) infoDiv.style.display = "none";
+      if (badge) badge.textContent = "";
+      return;
+    }
+
+    if (badge) badge.textContent = `(${preset.name})`;
+    if (infoDiv) {
+      infoDiv.style.display = "flex";
+      $("#preset-info-high").textContent = basename(preset.gguf_transformer_high) || "— default —";
+      $("#preset-info-low").textContent = basename(preset.gguf_transformer_low) || "— default —";
+      $("#preset-info-vae").textContent = basename(preset.vae_path) || "— default —";
+      const loraCount = (preset.loras || []).length;
+      $("#preset-info-loras").textContent = loraCount ? `${loraCount} adapter(s)` : "— config.yaml defaults —";
+      $("#preset-info-desc").textContent = preset.description || "—";
+    }
+  }
+
+  function applyPreset(presetId) {
+    if (!presetId) {
+      // Clear preset selection
+      $("#preset-id").value = "";
+      $("#preset-active-name").textContent = "";
+      // Reload LoRA grid from config defaults
+      rebuildLoraGrid(configLoras);
+      toast("Using config.yaml defaults", "info", 2000);
+      return;
+    }
+
+    const preset = presets.find(p => p.id === presetId);
+    if (!preset) {
+      toast("Preset not found", "error");
+      return;
+    }
+
+    // Store preset ID for generation
+    $("#preset-id").value = presetId;
+    $("#preset-active-name").textContent = `(${preset.name})`;
+
+    // Apply default generation parameters
+    const defs = preset.defaults || {};
+    if (defs.num_inference_steps) setParam("steps", defs.num_inference_steps);
+    if (defs.guidance_scale) setParam("cfg", defs.guidance_scale);
+    if (defs.guidance_scale_2) setParam("cfg2", defs.guidance_scale_2);
+    if (defs.flow_shift) setParam("flow-shift", defs.flow_shift);
+    if (defs.boundary_ratio) setParam("boundary-ratio", defs.boundary_ratio);
+
+    // Apply mode
+    if (defs.distill_lora_mode !== undefined) {
+      applyMode(defs.distill_lora_mode ? "fast" : "quality", true);
+    }
+
+    // Update LoRA grid if preset has custom LoRAs
+    if (preset.loras && preset.loras.length > 0) {
+      rebuildLoraGrid(preset.loras);
+    } else {
+      rebuildLoraGrid(configLoras);
+    }
+
+    // Update computed displays
+    updateTotalSteps();
+    updateFramesFromDuration();
+
+    toast(`Preset "${preset.name}" applied`, "success", 2000);
+  }
+
+  function rebuildLoraGrid(loras) {
+    const grid = $("#lora-grid");
+    if (!grid) return;
+
+    grid.innerHTML = "";
+    loras.forEach((lora, idx) => {
+      const isDistill = lora.role === "distill";
+      const isHigh = (lora.target || "transformer") === "transformer";
+      const disabledClass = (isDistill && currentMode === "quality") ? " lora-disabled" : "";
+
+      const card = document.createElement("div");
+      card.className = `lora-card${isDistill ? " lora-distill" : ""}${disabledClass}`;
+      card.dataset.index = idx;
+      card.dataset.role = lora.role || "quality";
+      card.innerHTML = `
+        <div class="lora-top">
+          <span class="lora-name" title="${lora.adapter_name || ""}">${lora.adapter_name || ""}</span>
+          <span class="lora-badge ${isHigh ? "badge-high" : "badge-low"}">
+            ${isHigh ? "HIGH" : "LOW"}
+          </span>
+          ${isDistill ? '<span class="lora-badge badge-distill" title="Distill LoRA — only active in Fast mode">⚡</span>' : ""}
+        </div>
+        <div class="lora-control">
+          <input type="range" class="lora-scale" data-lora="${idx}"
+                 value="${lora.scale || 1.0}" min="0" max="5" step="0.05" />
+          <input type="number" class="lora-scale-num" data-lora="${idx}"
+                 value="${lora.scale || 1.0}" min="0" max="5" step="0.05" />
+        </div>
+        <div class="lora-file" title="${lora.path || ""}">${basename(lora.path)}</div>
+      `;
+      grid.appendChild(card);
+    });
+
+    // Re-bind hybrid inputs for new LoRA cards
+    setupLoraHybridInputs();
+  }
+
+  // ─── Preset Editor ─────────────────────────────────────────
+
+  function openPresetEditor(presetId) {
+    editingPresetId = presetId;
+    const overlay = $("#preset-editor-overlay");
+    if (!overlay) return;
+
+    // Populate file dropdowns from available models
+    populateModelDropdowns();
+
+    if (presetId) {
+      // Editing existing preset
+      const preset = presets.find(p => p.id === presetId);
+      if (!preset) { toast("Preset not found", "error"); return; }
+      $("#preset-editor-title").textContent = `Edit: ${preset.name}`;
+      $("#pe-name").value = preset.name || "";
+      $("#pe-desc").value = preset.description || "";
+      $("#pe-high").value = preset.gguf_transformer_high || "";
+      $("#pe-low").value = preset.gguf_transformer_low || "";
+      $("#pe-vae").value = preset.vae_path || "";
+      $("#pe-text-enc").value = preset.text_encoder_path || "";
+
+      const defs = preset.defaults || {};
+      $("#pe-steps").value = defs.num_inference_steps || 20;
+      $("#pe-cfg").value = defs.guidance_scale || 5.0;
+      $("#pe-cfg2").value = defs.guidance_scale_2 || 5.0;
+      $("#pe-flow").value = defs.flow_shift || 8.0;
+      $("#pe-boundary").value = defs.boundary_ratio || 0.9;
+      $("#pe-distill").checked = defs.distill_lora_mode || false;
+
+      // Populate LoRA rows
+      const loraList = $("#pe-lora-list");
+      loraList.innerHTML = "";
+      (preset.loras || []).forEach(lora => addLoraRow(lora));
+    } else {
+      // Creating new preset
+      $("#preset-editor-title").textContent = "New Model Preset";
+      $("#pe-name").value = "";
+      $("#pe-desc").value = "";
+      $("#pe-high").value = "";
+      $("#pe-low").value = "";
+      $("#pe-vae").value = "";
+      $("#pe-text-enc").value = "";
+      $("#pe-steps").value = 20;
+      $("#pe-cfg").value = 5.0;
+      $("#pe-cfg2").value = 5.0;
+      $("#pe-flow").value = 8.0;
+      $("#pe-boundary").value = 0.9;
+      $("#pe-distill").checked = false;
+
+      const loraList = $("#pe-lora-list");
+      loraList.innerHTML = "";
+    }
+
+    overlay.style.display = "flex";
+  }
+
+  function closePresetEditor() {
+    const overlay = $("#preset-editor-overlay");
+    if (overlay) overlay.style.display = "none";
+    editingPresetId = null;
+  }
+
+  function populateModelDropdowns() {
+    const models = availableModels;
+
+    // GGUF transformers
+    populateSelect("#pe-high", models.unet || [], "— Use config.yaml default —");
+    populateSelect("#pe-low", models.unet || [], "— Use config.yaml default —");
+    populateSelect("#pe-vae", models.vae || [], "— Use config.yaml default —");
+    populateSelect("#pe-text-enc", models.text_encoders || [], "— Use config.yaml default —");
+  }
+
+  function populateSelect(selector, files, emptyLabel) {
+    const sel = $(selector);
+    if (!sel) return;
+    const currentVal = sel.value;
+    sel.innerHTML = `<option value="">${emptyLabel}</option>`;
+    for (const f of files) {
+      const opt = document.createElement("option");
+      opt.value = f.path;
+      opt.textContent = `${f.filename} (${f.size_mb} MB)`;
+      sel.appendChild(opt);
+    }
+    sel.value = currentVal; // try to restore
+  }
+
+  function addLoraRow(lora) {
+    const list = $("#pe-lora-list");
+    if (!list) return;
+    const loraFiles = availableModels.loras || [];
+
+    const row = document.createElement("div");
+    row.className = "pe-lora-row";
+
+    // File selector
+    const fileSel = document.createElement("select");
+    fileSel.innerHTML = '<option value="">— Select LoRA —</option>';
+    for (const f of loraFiles) {
+      const opt = document.createElement("option");
+      opt.value = f.path;
+      opt.textContent = f.filename;
+      fileSel.appendChild(opt);
+    }
+    if (lora?.path) fileSel.value = lora.path;
+
+    // Adapter name
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.placeholder = "adapter_name";
+    nameInput.value = lora?.adapter_name || "";
+
+    // Auto-fill adapter name from filename
+    fileSel.addEventListener("change", () => {
+      if (!nameInput.value && fileSel.value) {
+        const fname = fileSel.value.split("/").pop().replace(/\.safetensors$/, "");
+        nameInput.value = fname.replace(/[^a-zA-Z0-9_]/g, "_").substring(0, 30);
+      }
+    });
+
+    // Target select
+    const targetSel = document.createElement("select");
+    targetSel.className = "pe-target";
+    targetSel.innerHTML = `
+      <option value="transformer">HIGH</option>
+      <option value="transformer_2">LOW</option>
+    `;
+    if (lora?.target) targetSel.value = lora.target;
+
+    // Role select
+    const roleSel = document.createElement("select");
+    roleSel.className = "pe-role";
+    roleSel.innerHTML = `
+      <option value="quality">Quality</option>
+      <option value="distill">Distill</option>
+    `;
+    if (lora?.role) roleSel.value = lora.role;
+
+    // Scale
+    const scaleInput = document.createElement("input");
+    scaleInput.type = "number";
+    scaleInput.min = "0";
+    scaleInput.max = "5";
+    scaleInput.step = "0.05";
+    scaleInput.value = lora?.scale ?? 1.0;
+
+    // Remove button
+    const removeBtn = document.createElement("button");
+    removeBtn.className = "btn-remove-lora";
+    removeBtn.textContent = "✕";
+    removeBtn.title = "Remove this LoRA";
+    removeBtn.addEventListener("click", () => row.remove());
+
+    row.appendChild(fileSel);
+    row.appendChild(nameInput);
+    row.appendChild(targetSel);
+    row.appendChild(roleSel);
+    row.appendChild(scaleInput);
+    row.appendChild(removeBtn);
+    list.appendChild(row);
+  }
+
+  function gatherPresetData() {
+    const loras = [];
+    $$("#pe-lora-list .pe-lora-row").forEach(row => {
+      const selects = row.querySelectorAll("select");
+      const inputs = row.querySelectorAll("input");
+      const path = selects[0]?.value || "";
+      const adapterName = inputs[0]?.value || "";
+      const target = selects[1]?.value || "transformer";
+      const role = selects[2]?.value || "quality";
+      const scale = parseFloat(inputs[1]?.value) || 1.0;
+      if (path) {
+        loras.push({ path, adapter_name: adapterName, target, role, scale });
+      }
+    });
+
+    return {
+      name: $("#pe-name").value.trim(),
+      description: $("#pe-desc").value.trim(),
+      gguf_transformer_high: $("#pe-high").value,
+      gguf_transformer_low: $("#pe-low").value,
+      vae_path: $("#pe-vae").value,
+      text_encoder_path: $("#pe-text-enc").value,
+      loras: loras,
+      defaults: {
+        num_inference_steps: parseInt($("#pe-steps").value) || 20,
+        guidance_scale: parseFloat($("#pe-cfg").value) || 5.0,
+        guidance_scale_2: parseFloat($("#pe-cfg2").value) || 5.0,
+        flow_shift: parseFloat($("#pe-flow").value) || 8.0,
+        boundary_ratio: parseFloat($("#pe-boundary").value) || 0.9,
+        distill_lora_mode: $("#pe-distill").checked || false,
+      },
+    };
+  }
+
+  async function savePreset() {
+    const data = gatherPresetData();
+    if (!data.name) {
+      toast("Preset name is required", "warning");
+      return;
+    }
+
+    try {
+      let r;
+      if (editingPresetId) {
+        r = await fetch(`/api/presets/${editingPresetId}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data),
+        });
+      } else {
+        r = await fetch("/api/presets", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data),
+        });
+      }
+      const result = await r.json();
+      if (r.ok) {
+        toast(`Preset "${data.name}" saved`, "success");
+        closePresetEditor();
+        await refreshPresets();
+        // Select the saved preset
+        const sel = $("#preset-select");
+        if (sel && result.id) {
+          sel.value = result.id;
+          updatePresetInfo(result.id);
+        }
+      } else {
+        toast("Save failed: " + (result.error || "unknown"), "error");
+      }
+    } catch (e) {
+      toast("Save error: " + e.message, "error");
+    }
+  }
+
+  async function deletePresetUI(presetId) {
+    if (!presetId) return;
+    const preset = presets.find(p => p.id === presetId);
+    const name = preset?.name || presetId;
+    if (!confirm(`Delete preset "${name}"?`)) return;
+
+    try {
+      const r = await fetch(`/api/presets/${presetId}`, { method: "DELETE" });
+      if (r.ok) {
+        toast(`Preset "${name}" deleted`, "info");
+        await refreshPresets();
+        $("#preset-id").value = "";
+        updatePresetInfo("");
+      } else {
+        toast("Delete failed", "error");
+      }
+    } catch (e) {
+      toast("Delete error: " + e.message, "error");
+    }
+  }
+
+  async function refreshPresets() {
+    try {
+      const r = await fetch("/api/presets");
+      presets = await r.json();
+      const sel = $("#preset-select");
+      if (!sel) return;
+      const currentVal = sel.value;
+      sel.innerHTML = '<option value="">— Use config.yaml defaults —</option>';
+      for (const p of presets) {
+        const opt = document.createElement("option");
+        opt.value = p.id;
+        opt.textContent = p.name;
+        sel.appendChild(opt);
+      }
+      sel.value = currentVal;
+      $("#btn-preset-delete").style.display = sel.value ? "inline-flex" : "none";
+    } catch (e) {
+      console.error("Failed to refresh presets:", e);
+    }
+  }
+
+  async function refreshAvailableModels() {
+    try {
+      const r = await fetch("/api/models/scan");
+      availableModels = await r.json();
+    } catch (e) {
+      console.error("Failed to scan models:", e);
+    }
+  }
+
   // ─── Init ───────────────────────────────────────────────────
   function init() {
     initTheme();
     connectSSE();
     setupDropZone();
-    setupSliders();
+    setupHybridInputs();
+    setupModeToggle();
     setupKeyboardShortcuts();
     setupVideoTabs();
+    setupSessionLogTabs();
+    setupPresets();
+
+    // Initialize computed values
+    updateFramesFromDuration();
+    updateInterpHint();
+    updateMegapixels();
+    updateTotalSteps();
+    updateTargetDurationHint();
 
     btnNew.addEventListener("click", showGeneratePanel);
     btnGenerate.addEventListener("click", startGeneration);
@@ -917,7 +1732,6 @@
     btnClone.addEventListener("click", cloneSession);
     btnTheme.addEventListener("click", toggleTheme);
 
-    // Resume buttons
     $$(".btn-resume").forEach(btn => {
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -925,15 +1739,11 @@
       });
     });
 
-    // Poll VRAM every 10s
     pollVRAM();
     setInterval(pollVRAM, 10000);
-
-    // Load sessions immediately, then refresh every 15s
     refreshSessions();
     setInterval(refreshSessions, 15000);
 
-    // Check if there's an active generation and auto-show it
     fetch("/api/active").then(r => r.json()).then(d => {
       if (d.running && d.session_id) {
         currentSessionId = d.session_id;

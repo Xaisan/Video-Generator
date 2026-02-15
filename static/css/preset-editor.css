@@ -1,0 +1,251 @@
+/*
+ * preset-editor.css — Preset editor window styles
+ * ==================================================
+ * Styles for the standalone preset editor page.
+ * theme.css provides the base variables and reset.
+ */
+
+body {
+  overflow-y: auto;
+  height: 100vh;
+}
+
+/* ── Editor layout ────────────────────────────────────────────────── */
+
+.editor-container {
+  max-width: 720px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.editor-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-sidebar);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.editor-header h1 {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.editor-header-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.editor-body {
+  flex: 1;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  overflow-y: auto;
+}
+
+.editor-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 14px 24px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-sidebar);
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
+}
+
+/* ── Sections ─────────────────────────────────────────────────────── */
+
+.editor-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.editor-section h2 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.section-header h2 {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+/* ── Field groups ─────────────────────────────────────────────────── */
+
+.field-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field-group label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+
+.field-input,
+.field-select {
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 13px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: inherit;
+  transition: border-color .15s;
+}
+
+.field-input:focus,
+.field-select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(88,166,255,.15);
+}
+
+.field-number {
+  width: 100%;
+  padding: 6px 10px;
+  font-size: 13px;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  text-align: right;
+}
+
+.field-number:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* ── Parameter grid ───────────────────────────────────────────────── */
+
+.param-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.field-sm {
+  min-width: 0;
+}
+
+.hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 4px 0;
+}
+
+/* ── LoRA list ────────────────────────────────────────────────────── */
+
+.lora-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 350px;
+  overflow-y: auto;
+}
+
+.lora-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  flex-wrap: wrap;
+}
+
+.lora-row select,
+.lora-row input[type="text"] {
+  padding: 4px 8px;
+  font-size: 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: inherit;
+}
+
+.lora-file-select {
+  flex: 2;
+  min-width: 120px;
+}
+
+.lora-name-input {
+  flex: 1;
+  min-width: 80px;
+}
+
+.lora-target-select {
+  width: 90px;
+  flex: 0 0 auto;
+}
+
+.lora-role-select {
+  width: 80px;
+  flex: 0 0 auto;
+}
+
+.lora-scale-input {
+  width: 56px;
+  padding: 4px 6px;
+  font-size: 12px;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  text-align: right;
+}
+
+.btn-remove-lora {
+  color: var(--danger);
+  cursor: pointer;
+  font-size: 14px;
+  border: none;
+  background: none;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.btn-remove-lora:hover {
+  opacity: 0.7;
+}
+
+/* ── Responsive ───────────────────────────────────────────────────── */
+
+@media (max-width: 600px) {
+  .param-grid { grid-template-columns: repeat(2, 1fr); }
+  .lora-row { flex-direction: column; align-items: stretch; }
+  .lora-target-select,
+  .lora-role-select { width: 100%; }
+  .editor-body { padding: 16px; }
+}

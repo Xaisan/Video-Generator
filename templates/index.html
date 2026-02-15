@@ -11,11 +11,28 @@
     <!-- ─── Sidebar ─────────────────────────────────────────── -->
     <aside id="sidebar">
       <div class="sidebar-header">
-        <h2>Sessions</h2>
+        <h2 id="sidebar-title" class="sidebar-title-clickable">Wan 2.2 I2V</h2>
         <div class="sidebar-header-actions">
           <button id="btn-theme" class="btn btn-xs btn-ghost" title="Toggle dark/light mode">🌙</button>
-          <button id="btn-new" class="btn btn-sm btn-primary" title="New generation (Ctrl+N)">+ New</button>
         </div>
+      </div>
+      <div class="sidebar-nav">
+        <button id="btn-dashboard" class="sidebar-nav-btn active" title="Dashboard overview">📊 Dashboard</button>
+        <button id="btn-new" class="sidebar-nav-btn" title="New generation (Ctrl+N)">🎬 Generate</button>
+        <button id="btn-presets-nav" class="sidebar-nav-btn" title="Manage model presets">🗂️ Presets</button>
+      </div>
+      <div class="sidebar-user-section">
+        <div class="user-switcher-row">
+          <select id="user-switcher" class="user-switcher-select" title="Switch user profile">
+            <option value="">🌐 Global (all sessions)</option>
+            {% for user in users %}
+            <option value="{{ user.id }}">{{ user.avatar }} {{ user.name }}</option>
+            {% endfor %}
+          </select>
+          <button id="btn-create-user" class="btn btn-xs btn-ghost" title="Create profile">+</button>
+          <button id="btn-manage-users" class="btn btn-xs btn-ghost" title="Manage profiles">⚙</button>
+        </div>
+        <span id="user-active-badge" class="user-active-badge">🌐 Global</span>
       </div>
       <div id="session-list" class="session-list"></div>
       <div class="sidebar-footer">
@@ -32,8 +49,139 @@
 
     <!-- ─── Main ────────────────────────────────────────────── -->
     <main id="main">
+      <!-- Panel: Dashboard -->
+      <section id="panel-dashboard" class="panel">
+        <div class="dash-header">
+          <h1>📊 Dashboard</h1>
+          <button id="btn-new-hero" class="btn btn-primary btn-lg">🎬 New Generation</button>
+        </div>
+
+        <!-- Active generation banner -->
+        <div id="dash-active-section" class="dash-active" style="display:none">
+          <div class="dash-active-header">
+            <span class="dash-active-title">⚡ Active Generation</span>
+            <span id="dash-active-status" class="si-status running">running</span>
+          </div>
+          <div class="dash-active-body">
+            <div class="dash-active-info">
+              <span class="dash-active-label">Session:</span>
+              <span id="dash-active-sid" class="mono">—</span>
+            </div>
+            <div class="dash-active-info">
+              <span class="dash-active-label">Prompt:</span>
+              <span id="dash-active-prompt">—</span>
+            </div>
+            <div id="dash-active-steps" class="dash-active-steps"></div>
+          </div>
+          <button id="btn-dash-view-active" class="btn btn-sm btn-primary">View Details →</button>
+        </div>
+
+        <!-- Stats cards -->
+        <div class="dash-stats-grid">
+          <div class="dash-stat-card dash-stat-gpu">
+            <div class="dash-stat-icon">🖥️</div>
+            <div class="dash-stat-body">
+              <div class="dash-stat-label">GPU</div>
+              <div id="dash-gpu-name" class="dash-stat-value-sm">Detecting…</div>
+              <div class="dash-stat-detail">
+                <span>Arch: <strong id="dash-gpu-arch">—</strong></span>
+                <span>PyTorch: <strong id="dash-gpu-pytorch">—</strong></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="dash-stat-card dash-stat-vram">
+            <div class="dash-stat-icon">💾</div>
+            <div class="dash-stat-body">
+              <div class="dash-stat-label">VRAM Usage</div>
+              <div class="dash-vram-gauge">
+                <svg viewBox="0 0 120 60" class="dash-vram-svg">
+                  <path d="M10,55 A50,50 0 0,1 110,55" fill="none" stroke="var(--border)" stroke-width="8" stroke-linecap="round" />
+                  <path id="dash-vram-gauge-fill" d="M10,55 A50,50 0 0,1 110,55" fill="none" stroke="var(--accent)" stroke-width="8" stroke-linecap="round" stroke-dasharray="157" stroke-dashoffset="157" />
+                </svg>
+                <div id="dash-vram-gauge-text" class="dash-vram-gauge-value">— / — GB</div>
+              </div>
+              <div id="dash-vram-detail" class="dash-stat-detail-center">Reserved: —</div>
+            </div>
+          </div>
+
+          <div class="dash-stat-card dash-stat-sessions">
+            <div class="dash-stat-icon">📁</div>
+            <div class="dash-stat-body">
+              <div class="dash-stat-label">Sessions</div>
+              <div class="dash-stat-value" id="dash-count-total">0</div>
+              <div class="dash-stat-breakdown">
+                <span class="dash-tag done">✓ <span id="dash-count-done">0</span></span>
+                <span class="dash-tag running">● <span id="dash-count-running">0</span></span>
+                <span class="dash-tag failed">✕ <span id="dash-count-failed">0</span></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="dash-stat-card dash-stat-presets">
+            <div class="dash-stat-icon">🗂️</div>
+            <div class="dash-stat-body">
+              <div class="dash-stat-label">Model Presets</div>
+              <div class="dash-stat-value" id="dash-count-presets">0</div>
+              <div class="dash-stat-detail-center">
+                <button id="btn-dash-presets" class="btn btn-xs btn-ghost">Manage →</button>
+                <a href="/presets/report" target="_blank" class="btn btn-xs btn-ghost" title="View full preset report">📄 Report</a>
+              </div>
+            </div>
+          </div>
+
+          <div class="dash-stat-card dash-stat-users">
+            <div class="dash-stat-icon">👥</div>
+            <div class="dash-stat-body">
+              <div class="dash-stat-label">User Profiles</div>
+              <div class="dash-stat-value" id="dash-count-users">0</div>
+              <div class="dash-stat-detail-center">
+                <button id="btn-dash-manage-users" class="btn btn-xs btn-ghost">Manage →</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="dash-stat-card dash-stat-disk">
+            <div class="dash-stat-icon">💿</div>
+            <div class="dash-stat-body">
+              <div class="dash-stat-label">Disk Usage</div>
+              <div class="dash-stat-detail">
+                <span>Sessions: <strong id="dash-disk-usage">—</strong></span>
+                <span>Output: <strong id="dash-disk-output">—</strong></span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Recent sessions gallery -->
+        <div class="dash-section">
+          <div class="dash-section-header">
+            <h2>🎬 Recent Sessions</h2>
+            <button id="btn-dash-view-all" class="btn btn-sm btn-ghost">View All →</button>
+          </div>
+          <div id="dash-gallery-grid" class="dash-gallery-grid"></div>
+        </div>
+
+        <!-- Quick reference -->
+        <div class="dash-section">
+          <details class="config-section">
+            <summary>⌨️ Keyboard Shortcuts</summary>
+            <div class="config-body">
+              <div class="dash-shortcuts-grid">
+                <div class="dash-shortcut"><span class="kbd">Enter</span> Start generation</div>
+                <div class="dash-shortcut"><span class="kbd">Esc</span> Cancel generation</div>
+                <div class="dash-shortcut"><span class="kbd">Ctrl+N</span> New generation panel</div>
+              </div>
+            </div>
+          </details>
+        </div>
+      </section>
+
       <!-- Panel: New/Resume Generation -->
-      <section id="panel-generate" class="panel">
+      <section id="panel-generate" class="panel" style="display:none">
+        <div class="panel-top-nav">
+          <button id="btn-back-to-dash" class="btn btn-ghost btn-sm">← Dashboard</button>
+        </div>
         <h1>Image-to-Video Generation</h1>
 
         <div class="form-grid">
@@ -62,6 +210,34 @@
             </div>
           </div>
         </div>
+
+        <!-- ─── Model Presets ──────────────────────────────── -->
+        <details class="config-section" open>
+          <summary>🗂️ Model Preset <span id="preset-active-name" class="preset-active-badge"></span></summary>
+          <div class="config-body">
+            <div class="preset-selector-row">
+              <select id="preset-select" class="param-select preset-select">
+                <option value="">— Use config.yaml defaults —</option>
+                {% for preset in presets %}
+                <option value="{{ preset.id }}">{{ preset.name }}</option>
+                {% endfor %}
+              </select>
+              <button id="btn-preset-apply" class="btn btn-sm btn-primary" title="Apply selected preset to form">✔ Apply</button>
+              <button id="btn-preset-edit" class="btn btn-sm btn-ghost" title="Edit selected preset">✏️</button>
+              <button id="btn-preset-new" class="btn btn-sm btn-ghost" title="Create new preset">+ New</button>
+              <button id="btn-preset-delete" class="btn btn-sm btn-danger" title="Delete selected preset" style="display:none">🗑</button>
+            </div>
+            <div id="preset-info" class="preset-info" style="display:none">
+              <div class="preset-info-row"><strong>High:</strong> <span id="preset-info-high">—</span></div>
+              <div class="preset-info-row"><strong>Low:</strong> <span id="preset-info-low">—</span></div>
+              <div class="preset-info-row"><strong>VAE:</strong> <span id="preset-info-vae">—</span></div>
+              <div class="preset-info-row"><strong>LoRAs:</strong> <span id="preset-info-loras">—</span></div>
+              <div class="preset-info-row"><strong>Description:</strong> <span id="preset-info-desc">—</span></div>
+            </div>
+          </div>
+        </details>
+
+        <input type="hidden" id="preset-id" value="" />
 
         <!-- ─── Generation Mode ──────────────────────────── -->
         <div class="mode-toggle-section">
@@ -316,7 +492,7 @@
           <div class="session-actions">
             <button id="btn-clone" class="btn btn-ghost btn-sm" title="Clone params to generate panel">📋 Clone</button>
             <button id="btn-cancel" class="btn btn-danger btn-sm" style="display:none">⏹ Cancel</button>
-            <button id="btn-back" class="btn btn-ghost btn-sm">← Back</button>
+            <button id="btn-back" class="btn btn-ghost btn-sm">← Dashboard</button>
             <button id="btn-delete-session" class="btn btn-danger btn-sm">🗑 Delete</button>
           </div>
         </div>
@@ -384,6 +560,7 @@
             <div><strong>Seed:</strong> <span id="info-seed">—</span></div>
             <div><strong>CFG:</strong> <span id="info-cfg">—</span></div>
             <div><strong>Status:</strong> <span id="info-status">—</span></div>
+            <div id="info-user-row" style="display:none"><strong>User:</strong> <span id="info-user">—</span></div>
             <div id="info-error-row"><strong>Error:</strong> <span id="info-error" class="error-text">—</span></div>
           </div>
         </div>
@@ -461,6 +638,27 @@
   <!-- Toast container -->
   <div id="toast-container" class="toast-container"></div>
 
-  <script src="/static/app.js"></script>
+  <!-- Server data for JS -->
+  <script>
+    window.__AVAILABLE_MODELS = {{ available_models | tojson }};
+    window.__PRESETS = {{ presets | tojson }};
+    window.__CONFIG_LORAS = {{ loras | tojson }};
+    window.__USERS = {{ users | tojson }};
+    window.__AVATAR_OPTIONS = {{ avatar_options | tojson }};
+  </script>
+  <!-- Modular JS: load order matters (state first, init last) -->
+  <script src="/static/js/state.js"></script>
+  <script src="/static/js/controls.js"></script>
+  <script src="/static/js/vram.js"></script>
+  <script src="/static/js/timer.js"></script>
+  <script src="/static/js/logs.js"></script>
+  <script src="/static/js/sessions.js"></script>
+  <script src="/static/js/dashboard.js"></script>
+  <script src="/static/js/upload.js"></script>
+  <script src="/static/js/presets.js"></script>
+  <script src="/static/js/users.js"></script>
+  <script src="/static/js/generate.js"></script>
+  <script src="/static/js/sse.js"></script>
+  <script src="/static/js/init.js"></script>
 </body>
 </html>

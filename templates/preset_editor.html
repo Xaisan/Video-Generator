@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Preset Editor — Wan 2.2 I2V</title>
+  <link rel="stylesheet" href="/static/css/theme.css" />
+  <link rel="stylesheet" href="/static/css/preset-editor.css" />
+</head>
+<body>
+  <div class="editor-container">
+    <!-- Header -->
+    <header class="editor-header">
+      <h1 id="editor-title">New Model Preset</h1>
+      <div class="editor-header-actions">
+        <button id="btn-duplicate" class="btn btn-sm btn-ghost" style="display:none" title="Duplicate this preset">📋 Duplicate</button>
+      </div>
+    </header>
+
+    <!-- Form -->
+    <div class="editor-body">
+      <!-- Name & Description -->
+      <section class="editor-section">
+        <div class="field-group">
+          <label for="pe-name">Preset Name</label>
+          <input type="text" id="pe-name" class="field-input" placeholder="My Quality Preset" />
+        </div>
+        <div class="field-group">
+          <label for="pe-desc">Description</label>
+          <input type="text" id="pe-desc" class="field-input" placeholder="Optional description..." />
+        </div>
+      </section>
+
+      <!-- Base Models -->
+      <section class="editor-section">
+        <h2>Base Models</h2>
+        <div class="field-group">
+          <label for="pe-high">High-Noise Transformer (GGUF)</label>
+          <select id="pe-high" class="field-select"></select>
+        </div>
+        <div class="field-group">
+          <label for="pe-low">Low-Noise Transformer (GGUF)</label>
+          <select id="pe-low" class="field-select"></select>
+        </div>
+        <div class="field-group">
+          <label for="pe-vae">VAE Model</label>
+          <select id="pe-vae" class="field-select"></select>
+        </div>
+        <div class="field-group">
+          <label for="pe-text-enc">Text Encoder</label>
+          <select id="pe-text-enc" class="field-select"></select>
+        </div>
+      </section>
+
+      <!-- LoRA Adapters -->
+      <section class="editor-section">
+        <div class="section-header">
+          <h2>LoRA Adapters</h2>
+          <button id="btn-add-lora" class="btn btn-xs btn-ghost">+ Add LoRA</button>
+        </div>
+        <div id="lora-list" class="lora-list"></div>
+        <p class="hint" id="lora-hint">No LoRAs configured — config.yaml defaults will be used.</p>
+      </section>
+
+      <!-- Default Generation Parameters -->
+      <section class="editor-section">
+        <h2>Default Generation Parameters</h2>
+        <div class="param-grid">
+          <div class="field-group field-sm">
+            <label for="pe-steps">Steps</label>
+            <input type="number" id="pe-steps" value="20" min="1" max="50" class="field-number" />
+          </div>
+          <div class="field-group field-sm">
+            <label for="pe-cfg">CFG High</label>
+            <input type="number" id="pe-cfg" value="5.0" min="1" max="20" step="0.1" class="field-number" />
+          </div>
+          <div class="field-group field-sm">
+            <label for="pe-cfg2">CFG Low</label>
+            <input type="number" id="pe-cfg2" value="5.0" min="1" max="20" step="0.1" class="field-number" />
+          </div>
+          <div class="field-group field-sm">
+            <label for="pe-flow">Flow Shift</label>
+            <input type="number" id="pe-flow" value="8.0" min="0" max="30" step="0.1" class="field-number" />
+          </div>
+          <div class="field-group field-sm">
+            <label for="pe-boundary">Boundary Ratio</label>
+            <input type="number" id="pe-boundary" value="0.9" min="0.1" max="0.95" step="0.01" class="field-number" />
+          </div>
+          <div class="field-group field-sm">
+            <label class="chk-label">
+              <input type="checkbox" id="pe-distill" />
+              Distill Mode
+            </label>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Footer -->
+    <footer class="editor-footer">
+      <button id="btn-save" class="btn btn-primary">💾 Save Preset</button>
+      <button id="btn-cancel" class="btn btn-ghost">Cancel</button>
+    </footer>
+  </div>
+
+  <!-- Toast container -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="/static/js/preset-editor.js"></script>
+</body>
+</html>

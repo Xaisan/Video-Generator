@@ -1,7 +1,36 @@
 #!/usr/bin/env python3
 """
-Web UI for Wan 2.2 I2V Video Generator.
-Flask + Server-Sent Events for real-time progress.
+app.py — Web UI & REST API for Wan 2.2 I2V Video Generator
+=========================================================
+
+This is the main entry point for the web application.
+Run: python app.py [--host 0.0.0.0] [--port 7860] [--debug]
+
+Responsibilities:
+  - Flask web server serving the single-page UI
+  - REST API endpoints for generation, session management, uploads
+  - Server-Sent Events (SSE) for real-time progress streaming
+  - Log capture ring buffer (stdout/stderr -> web UI)
+  - Background thread management for generation jobs
+
+Dependencies (project-internal):
+  -> session_manager.py  (SessionManager, StepStatus, STEP_ORDER)
+  -> pipeline_engine.py  (PipelineEngine, vram_stats, flush_vram, load_config)
+  -> amd_tune.py         (apply_amd_optimisations, detect_amd_gpu) -- at startup
+
+Key routes:
+  GET  /                              -> index page
+  POST /api/generate                  -> start new generation
+  POST /api/resume/<session_id>       -> resume from step
+  POST /api/cancel                    -> cancel running generation
+  GET  /api/sessions                  -> list sessions
+  GET  /api/events                    -> SSE stream
+  POST /api/upload                    -> upload input image
+  GET  /api/vram                      -> VRAM stats
+  GET  /api/config                    -> config.yaml as JSON
+  GET  /api/logs                      -> log ring buffer
+
+See also: API_REFERENCE.md, ARCHITECTURE.md
 """
 
 import collections
@@ -24,6 +53,8 @@ from werkzeug.utils import secure_filename
 
 from session_manager import SessionManager, StepStatus, STEP_ORDER
 from pipeline_engine import PipelineEngine, vram_stats, flush_vram, load_config
+from preset_manager import PresetManager, scan_model_folders
+from user_manager import UserManager, AVATAR_OPTIONS
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB uploads
@@ -34,8 +65,10 @@ app.jinja_env.filters["basename"] = lambda p: os.path.basename(p) if p else ""
 UPLOAD_DIR = Path("input")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# ─── Global state ──────────────────────────────────────────────────
+# ─── Global state ──────────────────────────────────────────────────────
 sm = SessionManager()
+pm = PresetManager()
+um = UserManager()
 engine: PipelineEngine | None = None
 cfg: dict = {}
 
@@ -163,19 +196,49 @@ def index():
                     "name": f.stem,
                 })
 
+    # Scan available model files for preset editor
+    available_models = scan_model_folders()
+
+    # Load presets
+    presets = pm.list_presets()
+
+    # Load users
+    users = um.list_users()
+
     return render_template("index.html",
                            sessions=[s.to_dict() for s in sessions],
                            config=config,
                            loras=loras,
                            upscale_models=upscale_models,
+                           available_models=available_models,
+                           presets=presets,
+                           users=users,
+                           avatar_options=AVATAR_OPTIONS,
                            step_order=STEP_ORDER)
+
+
+@app.route("/presets/editor")
+def preset_editor():
+    """Serve the standalone preset editor page (opens in a new window)."""
+    return render_template("preset_editor.html")
+
+
+@app.route("/presets/report")
+def preset_report():
+    """Serve a read-only preset report page."""
+    presets = pm.list_presets()
+    return render_template("preset_report.html", presets=presets)
 
 
 # ─── Routes: API ───────────────────────────────────────────────────
 
 @app.route("/api/sessions", methods=["GET"])
 def api_list_sessions():
-    sessions = sm.list_sessions(limit=100)
+    user_id = request.args.get("user_id", "")
+    if user_id:
+        sessions = sm.list_sessions_for_user(user_id, limit=100)
+    else:
+        sessions = sm.list_sessions(limit=100)
     return jsonify([s.to_dict() for s in sessions])
 
 
@@ -245,6 +308,9 @@ def api_generate():
             "lora_scales": data.get("lora_scales", []),
             "boundary_ratio": float(data.get("boundary_ratio", config.get("boundary_ratio", 0.9))),
             "distill_lora_mode": bool(data.get("distill_lora_mode", config.get("distill_lora_mode", False))),
+            # User assignment
+            "user_id": data.get("user_id", ""),
+            "user_name": data.get("user_name", ""),
         }
 
         # Memory / performance overrides — apply to engine cfg
@@ -256,6 +322,28 @@ def api_generate():
             "vae_slicing": data.get("vae_slicing", config.get("vae_slicing", True)),
             "force_vae_cpu": data.get("force_vae_cpu", config.get("force_vae_cpu", False)),
         }
+
+        # ── Preset model overrides ──
+        # If a preset_id is provided, override engine config with preset's model paths and LoRAs
+        preset_id = data.get("preset_id", "")
+        preset_overrides = {}
+        if preset_id:
+            preset = pm.get_preset(preset_id)
+            if preset:
+                params["preset_id"] = preset_id
+                params["preset_name"] = preset.get("name", "")
+                # Override model paths in engine config
+                if preset.get("gguf_transformer_high"):
+                    preset_overrides["gguf_transformer_high"] = preset["gguf_transformer_high"]
+                if preset.get("gguf_transformer_low"):
+                    preset_overrides["gguf_transformer_low"] = preset["gguf_transformer_low"]
+                if preset.get("vae_path"):
+                    preset_overrides["vae_path"] = preset["vae_path"]
+                if preset.get("text_encoder_path"):
+                    preset_overrides["text_encoder_path"] = preset["text_encoder_path"]
+                # Override LoRA config if preset has LoRAs defined
+                if preset.get("loras"):
+                    preset_overrides["loras"] = preset["loras"]
 
         # Validate input image
         if not params["input_image"] or not os.path.isfile(params["input_image"]):
@@ -296,6 +384,10 @@ def api_generate():
         for k, v in memory_overrides.items():
             eng.cfg[k] = v
         eng.cfg["boundary_ratio"] = params["boundary_ratio"]
+
+        # Apply preset model path overrides to engine config
+        for k, v in preset_overrides.items():
+            eng.cfg[k] = v
 
         def run():
             global active_thread, active_session_id
@@ -382,6 +474,24 @@ def api_resume(session_id):
         active_session_id = session_id
         eng.set_progress_callback(progress_callback)
 
+        # Apply preset model overrides if this session has a preset
+        if info.preset_id:
+            preset = pm.get_preset(info.preset_id)
+            if preset:
+                if preset.get("gguf_transformer_high"):
+                    eng.cfg["gguf_transformer_high"] = preset["gguf_transformer_high"]
+                if preset.get("gguf_transformer_low"):
+                    eng.cfg["gguf_transformer_low"] = preset["gguf_transformer_low"]
+                if preset.get("vae_path"):
+                    eng.cfg["vae_path"] = preset["vae_path"]
+                if preset.get("text_encoder_path"):
+                    eng.cfg["text_encoder_path"] = preset["text_encoder_path"]
+                if preset.get("loras"):
+                    eng.cfg["loras"] = preset["loras"]
+
+        # Apply per-session config overrides
+        eng.cfg["boundary_ratio"] = info.boundary_ratio
+
         def run():
             global active_thread, active_session_id
             try:
@@ -436,6 +546,63 @@ def api_active():
     })
 
 
+@app.route("/api/stats", methods=["GET"])
+def api_stats():
+    """Return system stats for the dashboard."""
+    from amd_tune import detect_amd_gpu
+
+    gpu_info = {}
+    try:
+        gpu_info = detect_amd_gpu()
+    except Exception:
+        gpu_info = {"available": False}
+
+    # Session counts by status
+    sessions = sm.list_sessions(limit=9999)
+    counts = {"total": len(sessions), "done": 0, "running": 0, "failed": 0,
+              "cancelled": 0, "pending": 0}
+    for s in sessions:
+        st = s.status
+        if st in counts:
+            counts[st] += 1
+        else:
+            counts[st] = counts.get(st, 0) + 1
+
+    # Disk usage
+    sessions_bytes = 0
+    output_bytes = 0
+    try:
+        sessions_dir = Path("sessions")
+        if sessions_dir.exists():
+            for f in sessions_dir.rglob("*"):
+                if f.is_file():
+                    sessions_bytes += f.stat().st_size
+        output_dir = Path("output")
+        if output_dir.exists():
+            for f in output_dir.rglob("*"):
+                if f.is_file():
+                    output_bytes += f.stat().st_size
+    except Exception:
+        pass
+
+    # Preset count
+    preset_count = len(pm.list_presets())
+
+    # User count
+    user_count = len(um.list_users())
+
+    return jsonify({
+        "gpu": gpu_info,
+        "sessions": counts,
+        "disk": {
+            "sessions_bytes": sessions_bytes,
+            "output_bytes": output_bytes,
+        },
+        "preset_count": preset_count,
+        "user_count": user_count,
+    })
+
+
 @app.route("/api/logs", methods=["GET"])
 def api_logs():
     """Return recent log lines (last N entries)."""
@@ -444,6 +611,66 @@ def api_logs():
     with log_lock:
         lines = [l for l in log_buffer if l["ts"] > since]
     return jsonify(lines[-n:])
+
+
+# ─── Routes: Model Presets ─────────────────────────────────────────
+
+@app.route("/api/models/scan", methods=["GET"])
+def api_scan_models():
+    """Scan model folders and return available files by type."""
+    return jsonify(scan_model_folders())
+
+
+@app.route("/api/presets", methods=["GET"])
+def api_list_presets():
+    """List all model presets."""
+    return jsonify(pm.list_presets())
+
+
+@app.route("/api/presets", methods=["POST"])
+def api_create_preset():
+    """Create a new model preset."""
+    data = request.json or {}
+    if not data.get("name"):
+        return jsonify({"error": "Preset name is required"}), 400
+    preset = pm.create_preset(data)
+    return jsonify(preset), 201
+
+
+@app.route("/api/presets/<preset_id>", methods=["GET"])
+def api_get_preset(preset_id):
+    """Get a single preset by ID."""
+    preset = pm.get_preset(preset_id)
+    if not preset:
+        return jsonify({"error": "Preset not found"}), 404
+    return jsonify(preset)
+
+
+@app.route("/api/presets/<preset_id>", methods=["PUT"])
+def api_update_preset(preset_id):
+    """Update an existing preset."""
+    data = request.json or {}
+    preset = pm.update_preset(preset_id, data)
+    if not preset:
+        return jsonify({"error": "Preset not found"}), 404
+    return jsonify(preset)
+
+
+@app.route("/api/presets/<preset_id>", methods=["DELETE"])
+def api_delete_preset(preset_id):
+    """Delete a preset."""
+    if pm.delete_preset(preset_id):
+        return jsonify({"ok": True})
+    return jsonify({"error": "Preset not found"}), 404
+
+
+@app.route("/api/presets/<preset_id>/duplicate", methods=["POST"])
+def api_duplicate_preset(preset_id):
+    """Duplicate an existing preset."""
+    preset = pm.duplicate_preset(preset_id)
+    if not preset:
+        return jsonify({"error": "Preset not found"}), 404
+    return jsonify(preset), 201
 
 
 @app.route("/api/sessions/<session_id>/clone", methods=["POST"])
@@ -474,12 +701,70 @@ def api_clone_session(session_id):
         "upscale_model": d.get("upscale_model", ""),
         "lora_scales": d.get("lora_scales", []),
         "boundary_ratio": d.get("boundary_ratio", 0.5),
+        "distill_lora_mode": d.get("distill_lora_mode", False),
         # input image: absolute path + URL for display
         "input_image": d.get("input_image", ""),
         "input_image_url": f"/sessions/{session_id}/input.png"
                           if (sm.session_dir(session_id) / "input.png").exists() else "",
+        # Preset info
+        "preset_id": d.get("preset_id", ""),
+        "preset_name": d.get("preset_name", ""),
+        # User info
+        "user_id": d.get("user_id", ""),
+        "user_name": d.get("user_name", ""),
     }
     return jsonify(clone)
+
+
+# ─── Routes: User Profiles ───────────────────────────────────────
+
+@app.route("/api/users", methods=["GET"])
+def api_list_users():
+    """List all user profiles."""
+    return jsonify(um.list_users())
+
+
+@app.route("/api/users", methods=["POST"])
+def api_create_user():
+    """Create a new user profile."""
+    data = request.json or {}
+    if not data.get("name", "").strip():
+        return jsonify({"error": "User name is required"}), 400
+    user = um.create_user(data)
+    return jsonify(user), 201
+
+
+@app.route("/api/users/<user_id>", methods=["GET"])
+def api_get_user(user_id):
+    """Get a single user profile."""
+    user = um.get_user(user_id)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    return jsonify(user)
+
+
+@app.route("/api/users/<user_id>", methods=["PUT"])
+def api_update_user(user_id):
+    """Update a user profile."""
+    data = request.json or {}
+    user = um.update_user(user_id, data)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    return jsonify(user)
+
+
+@app.route("/api/users/<user_id>", methods=["DELETE"])
+def api_delete_user(user_id):
+    """Delete a user profile. Sessions are preserved (become unowned)."""
+    if um.delete_user(user_id):
+        return jsonify({"ok": True})
+    return jsonify({"error": "User not found"}), 404
+
+
+@app.route("/api/users/avatars", methods=["GET"])
+def api_avatar_options():
+    """Return available avatar emoji options."""
+    return jsonify(AVATAR_OPTIONS)
 
 
 # ─── SSE endpoint ──────────────────────────────────────────────────
@@ -524,7 +809,7 @@ def serve_session_file(session_id, filename):
     if not sdir.exists():
         return "Not found", 404
     # Only allow safe file types
-    allowed = {".mp4", ".png", ".jpg", ".jpeg", ".webp", ".json"}
+    allowed = {".mp4", ".png", ".jpg", ".jpeg", ".webp", ".json", ".log"}
     ext = Path(filename).suffix.lower()
     if ext not in allowed:
         return "Forbidden", 403
