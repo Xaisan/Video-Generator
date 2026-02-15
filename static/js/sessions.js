@@ -143,6 +143,25 @@ const Sessions = (() => {
       }
     }
 
+    // Energy info
+    const energyRow = $("#info-energy-row");
+    if (energyRow) {
+      if (s.energy_wh > 0) {
+        energyRow.style.display = "";
+        let energyStr = `${s.energy_wh.toFixed(1)} Wh wall`;
+        if (s.gpu_energy_wh > 0) energyStr += ` (GPU: ${s.gpu_energy_wh.toFixed(1)} Wh)`;
+        if (s.peak_gpu_power_w > 0) energyStr += ` · Peak: ${s.peak_gpu_power_w.toFixed(0)}W`;
+        if (s.avg_gpu_power_w > 0) energyStr += ` · Avg: ${s.avg_gpu_power_w.toFixed(0)}W`;
+        if (s.energy_cost_kwh > 0 && s.energy_wh > 0) {
+          const cost = (s.energy_wh / 1000) * s.energy_cost_kwh;
+          energyStr += ` · $${cost.toFixed(4)}`;
+        }
+        $("#info-energy").textContent = energyStr;
+      } else {
+        energyRow.style.display = "none";
+      }
+    }
+
     if (s.status === "running") {
       $("#progress-section").style.display = "block";
       const btnCancel = $("#btn-cancel");

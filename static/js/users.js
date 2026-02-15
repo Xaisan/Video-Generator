@@ -90,10 +90,8 @@ const Users = (() => {
   }
 
   function getSessionsUrl() {
-    if (App.activeUserId) {
-      return `/api/sessions?user_id=${encodeURIComponent(App.activeUserId)}`;
-    }
-    return "/api/sessions";
+    // Always pass user_id — empty string means "global (unowned) sessions only"
+    return `/api/sessions?user_id=${encodeURIComponent(App.activeUserId || "")}`;
   }
 
   // ─── Create User Dialog ──────────────────────────────────────
@@ -345,7 +343,7 @@ const Users = (() => {
     const switcher = $("#user-switcher");
     if (!switcher) return;
     const currentVal = switcher.value;
-    switcher.innerHTML = '<option value="">🌐 Global (all sessions)</option>';
+    switcher.innerHTML = '<option value="">🌐 Global</option>';
     for (const u of users) {
       const opt = document.createElement("option");
       opt.value = u.id;

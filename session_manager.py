@@ -120,6 +120,13 @@ class SessionInfo:
     # LoRA overrides (list of {adapter_name, scale})
     lora_scales: list = field(default_factory=list)
 
+    # Energy tracking (populated after generation completes)
+    energy_wh: float = 0.0             # Estimated total wall energy in Wh
+    gpu_energy_wh: float = 0.0         # GPU-only energy in Wh
+    peak_gpu_power_w: float = 0.0      # Peak GPU power draw in W
+    avg_gpu_power_w: float = 0.0       # Average GPU power draw in W
+    energy_cost_kwh: float = 0.0       # Electricity price used ($/kWh)
+
     # Step statuses
     steps: dict = field(default_factory=lambda: {
         s: StepStatus.PENDING for s in STEP_ORDER
@@ -231,10 +238,13 @@ class SessionManager:
         return sessions
 
     def list_sessions_for_user(self, user_id: str, limit: int = 100) -> list[SessionInfo]:
-        """Return sessions filtered by user_id. Empty user_id = global (all sessions)."""
+        """Return sessions filtered by user_id.
+
+        If user_id is empty, returns only 'unowned' sessions (global space).
+        If user_id is set, returns only that user's sessions.
+        Use list_sessions() for an unfiltered list.
+        """
         all_sessions = self.list_sessions(limit=9999)
-        if not user_id:
-            return all_sessions[:limit]
         filtered = [s for s in all_sessions if s.user_id == user_id]
         return filtered[:limit]
 

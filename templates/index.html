@@ -24,7 +24,7 @@
       <div class="sidebar-user-section">
         <div class="user-switcher-row">
           <select id="user-switcher" class="user-switcher-select" title="Switch user profile">
-            <option value="">🌐 Global (all sessions)</option>
+            <option value="">🌐 Global</option>
             {% for user in users %}
             <option value="{{ user.id }}">{{ user.avatar }} {{ user.name }}</option>
             {% endfor %}
@@ -93,7 +93,7 @@
           <div class="dash-stat-card dash-stat-vram">
             <div class="dash-stat-icon">💾</div>
             <div class="dash-stat-body">
-              <div class="dash-stat-label">VRAM Usage</div>
+              <div class="dash-stat-label">VRAM (Reserved)</div>
               <div class="dash-vram-gauge">
                 <svg viewBox="0 0 120 60" class="dash-vram-svg">
                   <path d="M10,55 A50,50 0 0,1 110,55" fill="none" stroke="var(--border)" stroke-width="8" stroke-linecap="round" />
@@ -101,7 +101,7 @@
                 </svg>
                 <div id="dash-vram-gauge-text" class="dash-vram-gauge-value">— / — GB</div>
               </div>
-              <div id="dash-vram-detail" class="dash-stat-detail-center">Reserved: —</div>
+              <div id="dash-vram-detail" class="dash-stat-detail-center">Allocated: —</div>
             </div>
           </div>
 
@@ -150,6 +150,31 @@
                 <span>Output: <strong id="dash-disk-output">—</strong></span>
               </div>
             </div>
+          </div>
+
+          <div class="dash-stat-card dash-stat-energy">
+            <div class="dash-stat-icon">⚡</div>
+            <div class="dash-stat-body">
+              <div class="dash-stat-label">Total Energy</div>
+              <div class="dash-stat-value" id="dash-energy-total">—</div>
+              <div class="dash-stat-breakdown">
+                <span class="dash-tag">GPU: <strong id="dash-energy-gpu">—</strong></span>
+                <span class="dash-tag">Peak: <strong id="dash-energy-peak">—</strong></span>
+              </div>
+              <div class="dash-stat-detail-center">
+                <span id="dash-energy-cost" class="text-muted">—</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- System monitor -->
+        <div class="dash-section">
+          <div class="dash-section-header">
+            <h2>🔧 System Monitor</h2>
+          </div>
+          <div id="dash-system-monitor" class="dash-system-monitor">
+            <div class="text-muted" style="text-align:center;padding:12px">Loading…</div>
           </div>
         </div>
 
@@ -561,6 +586,7 @@
             <div><strong>CFG:</strong> <span id="info-cfg">—</span></div>
             <div><strong>Status:</strong> <span id="info-status">—</span></div>
             <div id="info-user-row" style="display:none"><strong>User:</strong> <span id="info-user">—</span></div>
+            <div id="info-energy-row" style="display:none"><strong>Energy:</strong> <span id="info-energy">—</span></div>
             <div id="info-error-row"><strong>Error:</strong> <span id="info-error" class="error-text">—</span></div>
           </div>
         </div>

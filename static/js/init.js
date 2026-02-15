@@ -96,13 +96,12 @@ document.addEventListener("DOMContentLoaded", () => {
   // Dashboard quick actions
   const viewActiveBtn = $("#btn-dash-view-active");
   if (viewActiveBtn) viewActiveBtn.addEventListener("click", () => {
-    fetch("/api/active").then(r => r.json()).then(d => {
-      if (d.running && d.session_id) {
-        setActiveNav("");
-        Dashboard.hide();
-        Sessions.show(d.session_id);
-      }
-    }).catch(() => {});
+    const sid = Dashboard.getActiveSessionId();
+    if (sid) {
+      setActiveNav("");
+      Dashboard.hide();
+      Sessions.show(sid);
+    }
   });
 
   const dashPresetsBtn = $("#btn-dash-presets");

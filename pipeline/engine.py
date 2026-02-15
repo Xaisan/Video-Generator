@@ -1144,7 +1144,8 @@ class PipelineEngine:
         # Init session logger if not already done (resume case)
         if self._slog is None or start_step != "encode":
             sdir = self.sm.session_dir(session_id)
-            self._slog = SessionLogger(sdir)
+            is_resume = start_step != "encode"
+            self._slog = SessionLogger(sdir, resume=is_resume)
             self._slog.header(info, self.cfg)
 
         self.sm.update_status(session_id, "running")
@@ -1163,8 +1164,15 @@ class PipelineEngine:
             if self._cancel_flag:
                 self.sm.update_status(session_id, "cancelled")
                 if self._slog:
+                    energy = self._slog.stop_power_monitor()
                     info = self.sm.get_session(session_id)
                     if info:
+                        info.energy_wh = energy.get("total_wh", 0)
+                        info.gpu_energy_wh = energy.get("gpu_wh", 0)
+                        info.peak_gpu_power_w = energy.get("peak_gpu_w", 0)
+                        info.avg_gpu_power_w = energy.get("avg_gpu_w", 0)
+                        info.energy_cost_kwh = self.cfg.get("electricity_cost_kwh", 0.12)
+                        self.sm._save_meta(info)
                         self._slog.summary(info, time.time() - self._slog._t0)
                     self._slog = None
                 return False
@@ -1174,15 +1182,30 @@ class PipelineEngine:
                 info = self.sm.get_session(session_id)
                 if info and info.steps.get(step_name) == StepStatus.FAILED:
                     if self._slog:
+                        energy = self._slog.stop_power_monitor()
+                        info.energy_wh = energy.get("total_wh", 0)
+                        info.gpu_energy_wh = energy.get("gpu_wh", 0)
+                        info.peak_gpu_power_w = energy.get("peak_gpu_w", 0)
+                        info.avg_gpu_power_w = energy.get("avg_gpu_w", 0)
+                        info.energy_cost_kwh = self.cfg.get("electricity_cost_kwh", 0.12)
+                        self.sm._save_meta(info)
                         self._slog.summary(info, time.time() - self._slog._t0)
                         self._slog = None
                     return False
 
         self.sm.update_status(session_id, "done")
-        # Write final summary
+        # Write final summary and save energy data
         if self._slog:
             info = self.sm.get_session(session_id)
             if info:
+                energy = self._slog.stop_power_monitor()
+                # Persist energy data to session metadata
+                info.energy_wh = energy.get("total_wh", 0)
+                info.gpu_energy_wh = energy.get("gpu_wh", 0)
+                info.peak_gpu_power_w = energy.get("peak_gpu_w", 0)
+                info.avg_gpu_power_w = energy.get("avg_gpu_w", 0)
+                info.energy_cost_kwh = self.cfg.get("electricity_cost_kwh", 0.12)
+                self.sm._save_meta(info)
                 self._slog.summary(info, time.time() - self._slog._t0)
             self._slog = None
         return True

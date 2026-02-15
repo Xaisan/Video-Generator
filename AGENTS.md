@@ -24,6 +24,8 @@
 | **`app.py`** | Web server + API | Flask app, routes (`/api/generate`, `/api/resume`, `/api/events`), SSE broadcasting, log capture. Entry point: `python app.py` |
 | **`pipeline_engine.py`** | **Backward-compat shim** | Re-exports everything from `pipeline/` package. Existing `from pipeline_engine import X` still works. **Do NOT add new code here.** |
 | **`session_manager.py`** | Persistence layer | `SessionManager` class, `SessionInfo` dataclass, `StepStatus` enum, `STEP_ORDER` list |
+| **`preset_manager.py`** | Preset persistence | `PresetManager` class, `scan_model_folders()`. Stores presets in `presets.json` |
+| **`user_manager.py`** | User profiles | `UserManager` class, `AVATAR_OPTIONS`. Stores profiles in `users.json`. No auth — optional identity for session separation |
 | **`generate.py`** | Standalone CLI | `build_pipeline()`, `generate()`, `main()`. Loads all models at once, no checkpointing. Shares some duplicated logic with `pipeline/` |
 | **`upscale.py`** | Post-processing | `upscale_video()` (main), `load_upscale_model()`, `tile_upscale()`, `upscale_frame()` |
 | **`rife_model.py`** | RIFE v4.7 neural net | `IFNet` class, `load_rife_model()`, `interpolate_frame()`, `interpolate_sequence()` |
@@ -31,8 +33,10 @@
 | **`config.yaml`** | Configuration | All model paths, generation params, memory settings, AMD tuning. Extensively commented |
 | **`models/server.py`** | Utility | Simple HTTP server to download model folders as ZIP (not part of main app) |
 | **`run.fish`** | Launch script | Docker run with AMD GPU passthrough flags |
-| **`templates/index.html`** | Web UI template | Jinja2, two-panel layout (generate form + session viewer) |
-| **`static/app.js`** | Frontend JS | SSE event handling, form sync, session list, progress bars |
+| **`templates/index.html`** | Web UI template | Jinja2, three-panel layout (dashboard + generate form + session detail), sidebar with user switcher |
+| **`templates/preset_editor.html`** | Preset editor | Standalone page opened in separate window via `window.open()` |
+| **`templates/preset_report.html`** | Preset report | Read-only formatted report of all presets, printable with JSON export |
+| **`static/app.js`** | **Deprecated** | Renamed to `app.js.bak`. Replaced by modular JS modules in `static/js/` |
 | **`static/style.css`** | Styles | CSS custom properties, dark/light theme |
 
 ### `pipeline/` package (split from old `pipeline_engine.py`)
@@ -83,6 +87,15 @@ The app is designed to fit a 14B model in 24 GB VRAM:
 ### 5. Two Generation Modes
 - **Quality mode** (`distill_lora_mode=false`): 20 steps, CFG=5.0, quality LoRAs only
 - **Distill/Fast mode** (`distill_lora_mode=true`): 4 steps, CFG=1.0 (baked), flow_shift=5.0, ~10× faster
+
+### 6. User Profiles
+- Optional user identity for session separation (no authentication)
+- Stored in `users.json` via `UserManager`
+- Sessions have `user_id` and `user_name` fields
+- Global space (empty `user_id`): shows all sessions
+- User space: shows only that user's sessions
+- Sessions created without a user are "unowned" — visible in global space
+- Deleting a user does NOT delete their sessions (they become unowned)
 
 ---
 

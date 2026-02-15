@@ -10,7 +10,10 @@ Dependencies: vram_utils (vram_stats, ram_stats)
 Used by: engine.PipelineEngine (each step logs through this)
 """
 
+import json
 import os
+import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -20,6 +23,129 @@ from pipeline.vram_utils import vram_stats, ram_stats
 from session_manager import STEP_ORDER
 
 
+# ── Constants for energy estimation ─────────────────────────────────
+# PSU efficiency curve (80 Plus Gold approximate):
+#   At 20% load ~87%, 50% load ~90%, 100% load ~87%
+#   We use a flat 88% as a reasonable average for mixed workloads.
+PSU_EFFICIENCY = 0.88
+# Fixed system overhead: CPU (~65W avg under mixed load) + RAM/fans/MB (~35W)
+SYSTEM_OVERHEAD_W = 100.0
+
+
+class PowerMonitor:
+    """Background thread that samples GPU power draw via rocm-smi.
+
+    Accumulates total energy consumed (in Wh) over the session.
+    Also tracks per-step energy and peak power.
+    """
+
+    def __init__(self, sample_interval: float = 2.0):
+        self._interval = sample_interval
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+
+        # Accumulated energy
+        self._gpu_energy_j: float = 0.0       # Joules from GPU
+        self._total_energy_j: float = 0.0     # Joules total (GPU + system + PSU loss)
+        self._samples: int = 0
+        self._peak_gpu_w: float = 0.0
+        self._last_gpu_w: float = 0.0
+        self._last_sample_time: float = 0.0
+
+        # Per-step tracking
+        self._current_step: str = ""
+        self._step_energy: dict[str, float] = {}  # step -> GPU joules
+
+    def start(self):
+        """Start the background sampling thread."""
+        self._stop.clear()
+        self._last_sample_time = time.time()
+        self._thread = threading.Thread(target=self._sample_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> dict:
+        """Stop sampling and return energy summary."""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+            self._thread = None
+        return self.get_summary()
+
+    def set_step(self, step: str):
+        """Set current pipeline step for per-step tracking."""
+        with self._lock:
+            self._current_step = step
+
+    def _read_gpu_power(self) -> float | None:
+        """Read GPU power from rocm-smi. Returns watts or None."""
+        try:
+            result = subprocess.run(
+                ["rocm-smi", "--showpower", "--json"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                card = data.get("card0", {})
+                raw = card.get("Average Graphics Package Power (W)")
+                if raw is not None:
+                    return float(raw)
+        except Exception:
+            pass
+        return None
+
+    def _sample_loop(self):
+        """Sampling loop — runs in background thread."""
+        while not self._stop.is_set():
+            now = time.time()
+            dt = now - self._last_sample_time
+            self._last_sample_time = now
+
+            gpu_w = self._read_gpu_power()
+            if gpu_w is not None:
+                with self._lock:
+                    # Energy = Power × Time (joules)
+                    gpu_j = gpu_w * dt
+                    # Total wall power = (GPU + system overhead) / PSU efficiency
+                    wall_w = (gpu_w + SYSTEM_OVERHEAD_W) / PSU_EFFICIENCY
+                    total_j = wall_w * dt
+
+                    self._gpu_energy_j += gpu_j
+                    self._total_energy_j += total_j
+                    self._samples += 1
+                    self._last_gpu_w = gpu_w
+                    if gpu_w > self._peak_gpu_w:
+                        self._peak_gpu_w = gpu_w
+
+                    # Per-step accumulation
+                    if self._current_step:
+                        self._step_energy[self._current_step] = \
+                            self._step_energy.get(self._current_step, 0) + gpu_j
+
+            self._stop.wait(self._interval)
+
+    def get_summary(self) -> dict:
+        """Return accumulated energy data."""
+        with self._lock:
+            gpu_wh = self._gpu_energy_j / 3600
+            total_wh = self._total_energy_j / 3600
+            avg_gpu_w = (self._gpu_energy_j / (self._samples * self._interval)
+                         if self._samples > 0 else 0)
+            step_wh = {k: v / 3600 for k, v in self._step_energy.items()}
+            return {
+                "gpu_wh": round(gpu_wh, 3),
+                "total_wh": round(total_wh, 3),
+                "gpu_kwh": round(gpu_wh / 1000, 6),
+                "total_kwh": round(total_wh / 1000, 6),
+                "peak_gpu_w": round(self._peak_gpu_w, 1),
+                "avg_gpu_w": round(avg_gpu_w, 1),
+                "samples": self._samples,
+                "step_gpu_wh": {k: round(v, 3) for k, v in step_wh.items()},
+                "system_overhead_w": SYSTEM_OVERHEAD_W,
+                "psu_efficiency": PSU_EFFICIENCY,
+            }
+
+
 class SessionLogger:
     """Writes two human-readable log files per session:
 
@@ -27,7 +153,7 @@ class SessionLogger:
     vram.log       — timestamped VRAM/RAM allocation timeline
     """
 
-    def __init__(self, session_dir: Path):
+    def __init__(self, session_dir: Path, resume: bool = False):
         self.session_dir = Path(session_dir)
         self.gen_path = self.session_dir / "generation.log"
         self.vram_path = self.session_dir / "vram.log"
@@ -37,15 +163,33 @@ class SessionLogger:
         self._last_alloc: float = 0.0
         self._last_reserved: float = 0.0
         self._step_t0: float = 0.0
+        self._resume: bool = resume
 
-        # Initialise VRAM log with header
-        with open(self.vram_path, "w") as f:
-            f.write(f"{'Elapsed':>8s}  {'Step':<14s}  {'Event':<45s}  "
-                    f"{'Alloc GB':>9s}  {'Rsrv GB':>9s}  {'Free GB':>9s}  "
-                    f"{'Δ Alloc':>9s}  {'Δ Rsrv':>9s}  "
-                    f"{'Peak A':>8s}  {'Peak R':>8s}  "
-                    f"{'RAM Used':>9s}  {'RAM Avail':>10s}\n")
-            f.write("─" * 190 + "\n")
+        # Power monitoring
+        self._power_monitor = PowerMonitor(sample_interval=2.0)
+        self._power_monitor.start()
+
+        if resume and self.vram_path.exists():
+            # Append a resume separator instead of overwriting
+            with open(self.vram_path, "a") as f:
+                f.write("\n" + "═" * 190 + "\n")
+                f.write(f"  RESUMED at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("═" * 190 + "\n")
+                f.write(f"{'Elapsed':>8s}  {'Step':<14s}  {'Event':<45s}  "
+                        f"{'Alloc GB':>9s}  {'Rsrv GB':>9s}  {'Free GB':>9s}  "
+                        f"{'Δ Alloc':>9s}  {'Δ Rsrv':>9s}  "
+                        f"{'Peak A':>8s}  {'Peak R':>8s}  "
+                        f"{'RAM Used':>9s}  {'RAM Avail':>10s}\n")
+                f.write("─" * 190 + "\n")
+        else:
+            # Fresh start — write header
+            with open(self.vram_path, "w") as f:
+                f.write(f"{'Elapsed':>8s}  {'Step':<14s}  {'Event':<45s}  "
+                        f"{'Alloc GB':>9s}  {'Rsrv GB':>9s}  {'Free GB':>9s}  "
+                        f"{'Δ Alloc':>9s}  {'Δ Rsrv':>9s}  "
+                        f"{'Peak A':>8s}  {'Peak R':>8s}  "
+                        f"{'RAM Used':>9s}  {'RAM Avail':>10s}\n")
+                f.write("─" * 190 + "\n")
 
     # ── generation.log helpers ──────────────────────────────────
 
@@ -54,7 +198,10 @@ class SessionLogger:
             f.write(text)
 
     def header(self, info, cfg: dict):
-        """Write the generation parameters header."""
+        """Write the generation parameters header.
+
+        On resume, appends a resume banner instead of overwriting.
+        """
         gpu_name = "N/A"
         gpu_total = 0.0
         if torch.cuda.is_available():
@@ -63,6 +210,19 @@ class SessionLogger:
 
         loras = cfg.get("loras", [])
         lora_overrides = getattr(info, "lora_scales", []) or []
+
+        if self._resume and self.gen_path.exists():
+            # Append a resume section instead of overwriting
+            with open(self.gen_path, "a") as f:
+                f.write("\n\n" + "═" * 80 + "\n")
+                f.write(f"  RESUMED: {info.session_id}\n")
+                f.write(f"  Resumed at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("═" * 80 + "\n\n")
+
+                f.write("═" * 80 + "\n")
+                f.write("  PIPELINE EXECUTION (continued)\n")
+                f.write("═" * 80 + "\n\n")
+            return
 
         with open(self.gen_path, "w") as f:
             f.write("═" * 80 + "\n")
@@ -145,6 +305,7 @@ class SessionLogger:
     def step_start(self, step: str):
         self._step_t0 = time.time()
         elapsed = self._step_t0 - self._t0
+        self._power_monitor.set_step(step)
         self._gwrite(f"\n┌─ STEP: {step.upper()} ─{'─' * (60 - len(step))}\n")
         self._gwrite(f"│  Started at T+{elapsed:.1f}s  "
                      f"({time.strftime('%H:%M:%S')})\n")
@@ -205,8 +366,15 @@ class SessionLogger:
         self.log(step, f"Pass {pass_num} step {i+1}/{total}  "
                  f"t={timestep:.0f}  VRAM={alloc:.2f} GB")
 
+    def stop_power_monitor(self) -> dict:
+        """Stop the power monitor and return energy summary."""
+        return self._power_monitor.stop()
+
     def summary(self, info, total_elapsed: float):
-        """Write final summary."""
+        """Write final summary including energy consumption."""
+        # Get energy data (monitor may already be stopped by engine)
+        energy = self._power_monitor.get_summary()
+
         self._gwrite("\n" + "═" * 80 + "\n")
         self._gwrite("  GENERATION SUMMARY\n")
         self._gwrite("═" * 80 + "\n\n")
@@ -220,12 +388,29 @@ class SessionLogger:
             status = info.steps.get(step_name, "pending")
             t = info.step_times.get(step_name, 0)
             pct = (t / total_elapsed * 100) if total_elapsed > 0 else 0
+            step_wh = energy.get("step_gpu_wh", {}).get(step_name, 0)
             self._gwrite(f"    {step_name:<12s}  {str(status):<10s}  "
-                         f"{t:7.1f}s  ({pct:4.1f}%)\n")
+                         f"{t:7.1f}s  ({pct:4.1f}%)  "
+                         f"GPU: {step_wh:.2f} Wh\n")
 
         self._gwrite(f"\n  VRAM peaks:\n")
         self._gwrite(f"    Allocated: {self._peak_alloc:.2f} GB\n")
         self._gwrite(f"    Reserved:  {self._peak_reserved:.2f} GB\n")
+
+        self._gwrite(f"\n  ⚡ Energy consumption:\n")
+        self._gwrite(f"    GPU energy:       {energy['gpu_wh']:.2f} Wh\n")
+        self._gwrite(f"    Peak GPU power:   {energy['peak_gpu_w']:.0f} W\n")
+        self._gwrite(f"    Avg GPU power:    {energy['avg_gpu_w']:.0f} W\n")
+        self._gwrite(f"    System overhead:  {energy['system_overhead_w']:.0f} W (constant)\n")
+        self._gwrite(f"    PSU efficiency:   {energy['psu_efficiency']*100:.0f}%\n")
+        self._gwrite(f"    Est. wall energy: {energy['total_wh']:.2f} Wh "
+                     f"({energy['total_kwh']:.4f} kWh)\n")
+        cost_kwh = getattr(info, "energy_cost_kwh", 0)
+        if cost_kwh > 0:
+            cost = energy["total_kwh"] * cost_kwh
+            self._gwrite(f"    Est. elec. cost:  ${cost:.4f} "
+                         f"(@ ${cost_kwh:.2f}/kWh)\n")
+        self._gwrite(f"    Samples taken:    {energy['samples']}\n")
 
         if info.error_message:
             self._gwrite(f"\n  Error: {info.error_message}\n")

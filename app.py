@@ -234,8 +234,11 @@ def preset_report():
 
 @app.route("/api/sessions", methods=["GET"])
 def api_list_sessions():
-    user_id = request.args.get("user_id", "")
-    if user_id:
+    # If user_id param is present (even ""), filter by it.
+    # Global (user_id="") shows only sessions with no owner.
+    # No param at all → return everything (used internally by stats).
+    if "user_id" in request.args:
+        user_id = request.args.get("user_id", "")
         sessions = sm.list_sessions_for_user(user_id, limit=100)
     else:
         sessions = sm.list_sessions(limit=100)
@@ -532,6 +535,132 @@ def api_vram():
     return jsonify(vram_stats())
 
 
+@app.route("/api/system", methods=["GET"])
+def api_system():
+    """Return detailed system/hardware stats: GPU power, temp, fan, clocks, CPU, RAM."""
+    result = {}
+
+    # ── GPU stats via rocm-smi ──
+    try:
+        import subprocess
+        raw = subprocess.run(
+            ["rocm-smi", "--showpower", "--showtemp", "--showfan", "--showuse",
+             "--showmeminfo", "vram", "--showclocks", "--json"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if raw.returncode == 0:
+            import json as _json
+            data = _json.loads(raw.stdout)
+            # Use card0 (primary GPU)
+            card = data.get("card0", {})
+            result["gpu"] = {
+                "temp_edge_c":     _safe_float(card.get("Temperature (Sensor edge) (C)")),
+                "temp_junction_c": _safe_float(card.get("Temperature (Sensor junction) (C)")),
+                "temp_memory_c":   _safe_float(card.get("Temperature (Sensor memory) (C)")),
+                "power_w":         _safe_float(card.get("Average Graphics Package Power (W)")),
+                "gpu_use_pct":     _safe_float(card.get("GPU use (%)")),
+                "fan_rpm":         _safe_float(card.get("Fan RPM")),
+                "fan_pct":         _safe_float(card.get("Fan speed (%)")),
+                "vram_total_b":    _safe_int(card.get("VRAM Total Memory (B)")),
+                "vram_used_b":     _safe_int(card.get("VRAM Total Used Memory (B)")),
+                "sclk":            card.get("sclk clock speed:", ""),
+                "mclk":            card.get("mclk clock speed:", ""),
+                "pcie":            card.get("pcie clock level", ""),
+            }
+    except Exception:
+        result["gpu"] = {}
+
+    # ── CPU / RAM via psutil ──
+    try:
+        import psutil
+        # CPU temperature (AMD k10temp or coretemp)
+        cpu_temp = None
+        try:
+            temps = psutil.sensors_temperatures()
+            for chip in ("k10temp", "coretemp", "zenpower"):
+                if chip in temps and temps[chip]:
+                    # Use Tctl / Package temp (first entry)
+                    cpu_temp = temps[chip][0].current
+                    break
+        except Exception:
+            pass
+
+        # CPU power via RAPL (if accessible)
+        cpu_power_w = None
+        try:
+            rapl_path = Path("/sys/class/powercap/intel-rapl:0/energy_uj")
+            if rapl_path.exists():
+                e1 = int(rapl_path.read_text().strip())
+                time.sleep(0.1)
+                e2 = int(rapl_path.read_text().strip())
+                cpu_power_w = round((e2 - e1) / 100_000, 1)  # µJ over 0.1s → W
+        except Exception:
+            pass
+
+        result["cpu"] = {
+            "model":       _cpu_model(),
+            "cores":       psutil.cpu_count(logical=True),
+            "usage_pct":   psutil.cpu_percent(interval=0),
+            "freq_mhz":    round(psutil.cpu_freq().current, 0) if psutil.cpu_freq() else None,
+            "freq_max_mhz": round(psutil.cpu_freq().max, 0) if psutil.cpu_freq() else None,
+            "load_avg":    list(os.getloadavg()),
+            "temp_c":      cpu_temp,
+            "power_w":     cpu_power_w,
+        }
+        mem = psutil.virtual_memory()
+        result["ram"] = {
+            "total_gb":     round(mem.total / 1024**3, 1),
+            "used_gb":      round(mem.used / 1024**3, 1),
+            "available_gb": round(mem.available / 1024**3, 1),
+            "percent":      mem.percent,
+        }
+        swap = psutil.swap_memory()
+        result["swap"] = {
+            "total_gb":  round(swap.total / 1024**3, 1),
+            "used_gb":   round(swap.used / 1024**3, 1),
+            "percent":   swap.percent,
+        }
+    except Exception:
+        result["cpu"] = {}
+        result["ram"] = {}
+        result["swap"] = {}
+
+    # ── Uptime ──
+    try:
+        import psutil
+        import datetime
+        boot = datetime.datetime.fromtimestamp(psutil.boot_time())
+        uptime = datetime.datetime.now() - boot
+        result["uptime_seconds"] = int(uptime.total_seconds())
+    except Exception:
+        result["uptime_seconds"] = None
+
+    return jsonify(result)
+
+
+def _safe_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+def _safe_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+def _cpu_model():
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if "model name" in line:
+                    return line.split(":")[1].strip()
+    except Exception:
+        pass
+    return None
+
+
 @app.route("/api/config", methods=["GET"])
 def api_config():
     return jsonify(get_cfg())
@@ -557,16 +686,26 @@ def api_stats():
     except Exception:
         gpu_info = {"available": False}
 
-    # Session counts by status
+    # Session counts by status + energy totals
     sessions = sm.list_sessions(limit=9999)
     counts = {"total": len(sessions), "done": 0, "running": 0, "failed": 0,
               "cancelled": 0, "pending": 0}
+    total_energy_wh = 0.0
+    total_gpu_energy_wh = 0.0
+    peak_gpu_power_all = 0.0
+    sessions_with_energy = 0
     for s in sessions:
         st = s.status
         if st in counts:
             counts[st] += 1
         else:
             counts[st] = counts.get(st, 0) + 1
+        if getattr(s, 'energy_wh', 0) > 0:
+            total_energy_wh += s.energy_wh
+            total_gpu_energy_wh += s.gpu_energy_wh
+            sessions_with_energy += 1
+            if s.peak_gpu_power_w > peak_gpu_power_all:
+                peak_gpu_power_all = s.peak_gpu_power_w
 
     # Disk usage
     sessions_bytes = 0
@@ -591,6 +730,11 @@ def api_stats():
     # User count
     user_count = len(um.list_users())
 
+    # Electricity cost from config
+    config = get_cfg()
+    cost_kwh = config.get("electricity_cost_kwh", 0.12)
+    total_cost = (total_energy_wh / 1000) * cost_kwh
+
     return jsonify({
         "gpu": gpu_info,
         "sessions": counts,
@@ -600,6 +744,14 @@ def api_stats():
         },
         "preset_count": preset_count,
         "user_count": user_count,
+        "energy": {
+            "total_wh": round(total_energy_wh, 2),
+            "gpu_wh": round(total_gpu_energy_wh, 2),
+            "peak_gpu_w": round(peak_gpu_power_all, 1),
+            "sessions_tracked": sessions_with_energy,
+            "cost_kwh": cost_kwh,
+            "total_cost": round(total_cost, 4),
+        },
     })
 
 

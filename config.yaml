@@ -201,6 +201,13 @@ rife_model: "models/upscale_models/rife47.pth"
 #   RealESRGAN_x4plus.pth       — RRDB/ESRGAN, 64MB, classic reliable upscaler
 #   4x_NMKD-Siax_200k.pth      — ESRGAN, 64MB, weak (legacy, not recommended)
 
+# ─── Energy monitoring ─────────────────────────────────────────────────
+# Electricity cost in your local currency per kWh (used for cost estimation).
+# Examples:  US avg ~$0.12, EU avg ~€0.25, UK avg £0.28, Romania avg ~€0.15
+# GPU power is sampled live via rocm-smi; CPU+system overhead is estimated at 100W.
+# PSU efficiency assumed at 88% (80 Plus Gold typical).
+electricity_cost_kwh: 0.35
+
 # ─── AMD-specific tuning ───────────────────────────────────────────
 # GPU profiles:
 #   7900 XTX (24 GB, gfx1100/RDNA3):  hsa=11.0.0, force_vae_cpu=false
